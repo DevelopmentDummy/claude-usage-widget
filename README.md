@@ -4,6 +4,8 @@
 
 프레임리스·투명·항상 위 플로팅 창으로 떠 있으면서, 각 provider의 OAuth 토큰을 직접 읽어 사용량 API를 호출합니다.
 
+![Preview](docs/preview.png)
+
 ## Features
 
 - **3 provider 통합 게이지**
