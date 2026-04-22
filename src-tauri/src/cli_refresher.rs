@@ -7,7 +7,43 @@ use tokio::time::timeout;
 use crate::errors::{AppError, AppResult};
 use crate::types::Provider;
 
-const SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
+const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn augmented_path() -> Option<String> {
+    let mut parts: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        if cfg!(windows) {
+            if let Some(appdata) = std::env::var_os("APPDATA") {
+                parts.push(PathBuf::from(appdata).join("npm"));
+            }
+            parts.push(home.join("AppData").join("Roaming").join("npm"));
+            parts.push(home.join(".bun").join("bin"));
+            parts.push(home.join(".volta").join("bin"));
+        } else {
+            parts.push(home.join(".npm-global").join("bin"));
+            parts.push(home.join(".bun").join("bin"));
+            parts.push(home.join(".volta").join("bin"));
+            parts.push(PathBuf::from("/usr/local/bin"));
+            parts.push(PathBuf::from("/opt/homebrew/bin"));
+        }
+    }
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let extras: Vec<String> = parts
+        .into_iter()
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    if extras.is_empty() {
+        return None;
+    }
+    let mut s = extras.join(sep);
+    if !existing.is_empty() {
+        s.push_str(sep);
+        s.push_str(&existing.to_string_lossy());
+    }
+    Some(s)
+}
 
 fn token_path(provider: Provider) -> PathBuf {
     let home = dirs::home_dir().unwrap_or_default();
@@ -42,19 +78,30 @@ fn commands(provider: Provider) -> (Command, Command) {
     light.args(light_args);
     let mut full = Command::new(&name);
     full.args(&full_args);
+    if let Some(p) = augmented_path() {
+        light.env("PATH", &p);
+        full.env("PATH", &p);
+    }
     (light, full)
 }
 
-async fn run_with_timeout(mut cmd: Command) -> AppResult<std::process::ExitStatus> {
+async fn run_with_timeout(mut cmd: Command) -> AppResult<(std::process::ExitStatus, String)> {
     cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let child = cmd.spawn().map_err(|e| AppError::Other(format!("spawn failed: {}", e)))?;
-    let mut child = child;
-    let status = timeout(SPAWN_TIMEOUT, child.wait())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd
+        .spawn()
+        .map_err(|e| AppError::Other(format!("spawn failed: {}", e)))?;
+    let output = timeout(SPAWN_TIMEOUT, child.wait_with_output())
         .await
         .map_err(|_| AppError::Other("cli spawn timed out".into()))??;
-    Ok(status)
+    let mut tail = String::from_utf8_lossy(&output.stderr).into_owned();
+    if tail.trim().is_empty() {
+        tail = String::from_utf8_lossy(&output.stdout).into_owned();
+    }
+    let tail = tail.trim().chars().rev().take(240).collect::<String>();
+    let tail: String = tail.chars().rev().collect();
+    Ok((output.status, tail))
 }
 
 pub async fn refresh_via_cli(provider: Provider) -> AppResult<()> {
@@ -63,22 +110,42 @@ pub async fn refresh_via_cli(provider: Provider) -> AppResult<()> {
 
     let (light, full) = commands(provider);
 
-    let _ = run_with_timeout(light).await.ok();
+    let light_result = run_with_timeout(light).await;
     let after_light = mtime(&path);
     if after_light != before && after_light.is_some() {
         return Ok(());
     }
 
-    let status = run_with_timeout(full).await?;
+    let (status, tail) = match run_with_timeout(full).await {
+        Ok(v) => v,
+        Err(e) => {
+            let light_msg = match light_result {
+                Ok((s, t)) => format!("light exit={:?} tail={}", s.code(), t),
+                Err(e2) => format!("light err={}", e2),
+            };
+            return Err(AppError::Other(format!(
+                "{} ({}; provider={})",
+                e,
+                light_msg,
+                provider.as_str()
+            )));
+        }
+    };
     let after_full = mtime(&path);
     if after_full != before && after_full.is_some() {
         return Ok(());
     }
     if !status.success() {
         return Err(AppError::Other(format!(
-            "cli exited non-zero and token file did not change (provider: {})",
+            "cli exit={:?} tail={} (provider={})",
+            status.code(),
+            tail,
             provider.as_str()
         )));
     }
-    Ok(())
+    Err(AppError::Other(format!(
+        "cli ran ok but token file unchanged (provider={}, tail={})",
+        provider.as_str(),
+        tail
+    )))
 }

@@ -66,8 +66,9 @@ export default function ProviderCard({ data }: { data: UsageResponse }) {
             {refreshing ? "갱신 중... (최대 15초)" : "CLI로 갱신"}
           </button>
           {cliError && (
-            <div className="mt-1.5 text-[10px] text-red-400">
-              CLI 실행 실패 — 수동 로그인 필요: <code>{LOGIN_CMD[data.provider]}</code>
+            <div className="mt-1.5 text-[10px] text-red-400 break-all">
+              <div>CLI 실행 실패 — 수동 로그인 필요: <code>{LOGIN_CMD[data.provider]}</code></div>
+              <div className="mt-0.5 opacity-80">{cliError}</div>
             </div>
           )}
         </div>

@@ -224,6 +224,14 @@ export default function App() {
   );
 
   const containerBase = "relative w-full flex flex-col";
+
+  const handleBodyDragMouseDown = async (e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    const el = e.target as HTMLElement | null;
+    if (!el) return;
+    if (el.closest("button, a, input, textarea, select, code, [data-no-drag]")) return;
+    await getCurrentWindow().startDragging();
+  };
   const bgStyle = { backgroundColor: `rgba(26, 26, 26, var(--widget-opacity, 0.92))` };
 
   const fadeClass = titleBarVisible ? "opacity-100" : "opacity-0 pointer-events-none";
@@ -250,17 +258,13 @@ export default function App() {
       <div
         ref={rootRef}
         className={containerBase}
+        onMouseDown={handleBodyDragMouseDown}
       >
         {header}
         <div
           data-window-drag-region="true"
           className={`flex flex-row items-center gap-2 px-2 py-1.5 overflow-x-auto border-x border-b border-border/60 ${titleBarVisible ? "rounded-b-xl" : "rounded-xl border-t"}`}
           style={bgStyle}
-          onMouseDown={async (e) => {
-            const el = e.target as HTMLElement;
-            if (el.closest("button")) return;
-            if (e.button === 0) await getCurrentWindow().startDragging();
-          }}
         >
           <button
             onClick={cycleProvider}
@@ -308,6 +312,7 @@ export default function App() {
     <div
       ref={rootRef}
       className={containerBase}
+      onMouseDown={handleBodyDragMouseDown}
     >
       {header}
       <div
