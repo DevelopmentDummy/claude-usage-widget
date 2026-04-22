@@ -11,9 +11,14 @@ interface Props {
 
 export default function SettingsMenu({ settings, onChange, onClose }: Props) {
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
+    const keyHandler = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    const blurHandler = () => onClose();
+    window.addEventListener("keydown", keyHandler);
+    window.addEventListener("blur", blurHandler);
+    return () => {
+      window.removeEventListener("keydown", keyHandler);
+      window.removeEventListener("blur", blurHandler);
+    };
   }, [onClose]);
 
   const update = async (patch: Partial<Settings>) => {
@@ -31,8 +36,16 @@ export default function SettingsMenu({ settings, onChange, onClose }: Props) {
 
   return (
     <>
-      <div className="fixed inset-0 z-40" onClick={onClose} />
-      <div className="absolute right-2 top-10 z-50 w-60 bg-surface border border-border rounded-lg shadow-xl p-3 text-xs space-y-2.5">
+      <div
+        data-no-drag
+        className="fixed inset-0 z-40"
+        onMouseDown={(e) => { e.stopPropagation(); onClose(); }}
+      />
+      <div
+        data-no-drag
+        onMouseDown={(e) => e.stopPropagation()}
+        className="absolute right-2 top-10 z-50 w-60 bg-surface border border-border rounded-lg shadow-xl p-3 text-xs space-y-2.5"
+      >
         <div>
           <div className="mb-1">뷰 모드</div>
           <div className="flex gap-1">
@@ -119,7 +132,7 @@ export default function SettingsMenu({ settings, onChange, onClose }: Props) {
         </div>
 
         <div className="pt-2 border-t border-border/40 flex justify-between items-center">
-          <span className="text-text-dim">v0.1.0</span>
+          <span className="text-text-dim">v0.2.0</span>
           <button
             onClick={() => ipc.openUrl("https://github.com/")}
             className="text-accent hover:underline"
