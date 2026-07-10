@@ -147,7 +147,9 @@ fn commands(provider: Provider) -> (Option<Command>, Option<Command>, String) {
         Provider::Codex => &["codex"],
     };
     let (light_args, full_args): (Vec<&str>, Vec<&str>) = match provider {
-        Provider::Claude | Provider::Gemini => (vec!["--version"], vec!["-p", prompt]),
+        // 토큰 리프레시는 인증된 호출 한 번만 트리거하면 되므로 가장 싼 모델(haiku)로 스폰한다.
+        Provider::Claude => (vec!["--version"], vec!["-p", prompt, "--model", "haiku"]),
+        Provider::Gemini => (vec!["--version"], vec!["-p", prompt]),
         Provider::Codex => (vec!["--version"], vec!["exec", prompt]),
     };
     let path_env = augmented_path();
