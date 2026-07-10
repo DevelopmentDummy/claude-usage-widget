@@ -14,6 +14,8 @@ pub enum AppError {
     Expired,
     #[error("api error {status}: {message}")]
     Api { status: u16, message: String },
+    #[error("rate limited (retry_after={retry_after:?})")]
+    RateLimited { retry_after: Option<u64> },
     #[error("other: {0}")]
     Other(String),
 }

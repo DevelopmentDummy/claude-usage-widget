@@ -154,9 +154,11 @@ export default function App() {
     let cancelled = false;
     let timer: number | undefined;
     const baseSec = Math.max(30, settings?.refreshIntervalSec ?? 300);
+    // 주기 폴링은 force=false — 백엔드 TTL 캐시/냉각이 실제 요청 빈도를 제어하게 한다.
+    // (수동 새로고침 버튼/F5만 force=true)
     const schedule = (sec: number) => {
       if (cancelled) return;
-      timer = window.setTimeout(() => run(true), sec * 1000);
+      timer = window.setTimeout(() => run(false), sec * 1000);
     };
     const run = (force: boolean) => {
       ipc

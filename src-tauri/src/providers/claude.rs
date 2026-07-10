@@ -186,11 +186,24 @@ pub async fn fetch() -> AppResult<UsageResponse> {
         return Err(AppError::Expired);
     }
     if !status.is_success() {
+        let retry_after = res
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok());
         let body = res.text().await.unwrap_or_default();
         crate::diag::log(
             "claude",
-            &format!("fetch: non-2xx status={} body={}", status.as_u16(), body),
+            &format!(
+                "fetch: non-2xx status={} retry_after={:?} body={}",
+                status.as_u16(),
+                retry_after,
+                body
+            ),
         );
+        if status.as_u16() == 429 {
+            return Err(AppError::RateLimited { retry_after });
+        }
         return Err(AppError::Api { status: status.as_u16(), message: body });
     }
 
