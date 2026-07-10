@@ -25,10 +25,24 @@ jobs:
       - run: npm ci
 
       - uses: tauri-apps/tauri-action@v0
+        id: tauri
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Claude Usage Widget ${{ github.ref_name }}"
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
+
+      - name: Attach standalone exe to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $exe = "src-tauri/target/release/claude_usage.exe"
+          if (!(Test-Path $exe)) {
+            Write-Host "Listing target/release exes for debugging:"
+            Get-ChildItem src-tauri/target/release -Filter *.exe | Select-Object -Expand FullName
+            throw "standalone exe not found at $exe"
+          }
+          gh release upload ${{ github.ref_name }} $exe --clobber

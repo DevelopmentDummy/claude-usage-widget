@@ -56,6 +56,9 @@ export default function ProviderCard({ data }: { data: UsageResponse }) {
       <div className="flex items-center gap-2 mb-2">
         <span className="inline-block w-2 h-2 rounded-full" style={{ backgroundColor: COLORS[data.provider] }} />
         <span className="text-xs text-text-dim">{label}</span>
+        {data.status === "rate_limited" && (
+          <span title={data.error ?? "요청 제한"} className="text-[9px] px-1 py-[1px] rounded bg-yellow-500/20 text-yellow-500">제한됨</span>
+        )}
         {data.status === "network_error" && (
           <span title={data.error} className="text-xs text-yellow-500">⚠</span>
         )}
@@ -87,15 +90,23 @@ export default function ProviderCard({ data }: { data: UsageResponse }) {
         </div>
       )}
 
-      {data.status === "ok" && data.windows.map((w) => (
+      {data.windows.map((w) => (
         <UsageGauge key={`${data.provider}-${w.key}`} window={w} />
       ))}
 
-      {data.status !== "ok" && data.error && (
-        <div className="mt-1 text-[10px] text-red-400 break-all">
-          [{data.status}] {data.error}
-        </div>
+      {data.status === "rate_limited" && data.windows.length > 0 && (
+        <div className="mt-1 text-[10px] text-yellow-500/80">요청 제한 — 마지막 값 표시 중</div>
       )}
+
+      {data.windows.length === 0 &&
+        data.status !== "ok" &&
+        data.status !== "not_authenticated" &&
+        data.status !== "expired" &&
+        data.error && (
+          <div className="mt-1 text-[10px] text-red-400 break-all">
+            [{data.status}] {data.error}
+          </div>
+        )}
 
       {data.status === "ok" && data.extraUsage?.isEnabled && (
         <div className="mt-1 pt-1 border-t border-border/40">

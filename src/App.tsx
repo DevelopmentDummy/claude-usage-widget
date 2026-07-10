@@ -152,15 +152,30 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
+    let timer: number | undefined;
+    const baseSec = Math.max(30, settings?.refreshIntervalSec ?? 300);
+    const schedule = (sec: number) => {
+      if (cancelled) return;
+      timer = window.setTimeout(() => run(true), sec * 1000);
+    };
     const run = (force: boolean) => {
-      ipc.getProviderUsage(activeTab, force).then((snap) => {
-        if (!cancelled) setSnapshots((s) => ({ ...s, [activeTab]: snap }));
-      });
+      ipc
+        .getProviderUsage(activeTab, force)
+        .then((snap) => {
+          if (cancelled) return;
+          setSnapshots((s) => ({ ...s, [activeTab]: snap }));
+          // 레이트리밋이면 폴링 간격을 늘려 백오프한다(엔드포인트 회복 유도, 최대 15분).
+          const nextSec =
+            snap.response.status === "rate_limited" ? Math.min(baseSec * 4, 900) : baseSec;
+          schedule(nextSec);
+        })
+        .catch(() => schedule(baseSec));
     };
     run(false);
-    const intervalSec = settings?.refreshIntervalSec ?? 300;
-    const id = setInterval(() => run(true), Math.max(30, intervalSec) * 1000);
-    return () => { cancelled = true; clearInterval(id); };
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) clearTimeout(timer);
+    };
   }, [activeTab, settings?.refreshIntervalSec]);
 
   useEffect(() => {
@@ -282,7 +297,7 @@ export default function App() {
           >
             {PROVIDER_CODE[activeTab]}
           </button>
-          {activeSnap?.response.status === "ok" && activeSnap.response.windows.length > 0 ? (
+          {activeSnap && activeSnap.response.windows.length > 0 ? (
             activeSnap.response.windows.map((w) => (
               <MiniGauge key={w.key} window={w} provider={activeTab} />
             ))

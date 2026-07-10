@@ -131,8 +131,26 @@ impl AppState {
             Ok(r) => r,
             Err(e) => error_to_response(provider, e),
         };
+        // 일시적 오류(레이트리밋/네트워크)면 마지막 정상 수치와 시각을 유지해
+        // 게이지가 비지 않고 "제한됨" 배지만 뜨도록 한다.
+        let mut fetched_at = chrono::Utc::now().to_rfc3339();
+        let resp = if matches!(resp.status, Status::RateLimited | Status::NetworkError) {
+            let guard = self.per_provider.lock().await;
+            match guard.get(&provider) {
+                Some(prev) if !prev.response.windows.is_empty() => {
+                    let mut merged = resp;
+                    merged.windows = prev.response.windows.clone();
+                    merged.extra_usage = prev.response.extra_usage.clone();
+                    fetched_at = prev.fetched_at.clone();
+                    merged
+                }
+                _ => resp,
+            }
+        } else {
+            resp
+        };
         let snap = ProviderSnapshot {
-            fetched_at: chrono::Utc::now().to_rfc3339(),
+            fetched_at,
             response: resp.clone(),
         };
         {
@@ -165,7 +183,7 @@ fn error_to_response(provider: Provider, err: AppError) -> UsageResponse {
         AppError::NotAuthenticated(m) => (Status::NotAuthenticated, m),
         AppError::Expired => (Status::Expired, "token expired".into()),
         AppError::Http(e) => (Status::NetworkError, e.to_string()),
-        AppError::Api { status: 429, .. } => (Status::NetworkError, "rate limited".into()),
+        AppError::Api { status: 429, .. } => (Status::RateLimited, "요청 제한 (429)".into()),
         AppError::Api { status, message } => (Status::UnknownError, format!("api {}: {}", status, message)),
         other => (Status::UnknownError, other.to_string()),
     };

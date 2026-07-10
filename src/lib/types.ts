@@ -1,5 +1,5 @@
 export type Provider = "claude" | "codex" | "gemini";
-export type Status = "ok" | "not_authenticated" | "expired" | "network_error" | "unknown_error";
+export type Status = "ok" | "not_authenticated" | "expired" | "network_error" | "rate_limited" | "unknown_error";
 
 export interface UsageWindow {
   key: string;

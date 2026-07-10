@@ -25,6 +25,7 @@ pub enum Status {
     NotAuthenticated,
     Expired,
     NetworkError,
+    RateLimited,
     UnknownError,
 }
 
