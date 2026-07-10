@@ -150,35 +150,21 @@ export default function App() {
     };
   }, []);
 
+  // 주기 폴링은 백엔드 tokio 타이머가 담당하고 usage:provider_updated 이벤트로
+  // push한다(위에서 onProviderUpdated로 구독). 여기서는 탭 전환 시 해당 탭을
+  // 한 번만 당겨온다(force=false — 신선하면 캐시 즉시 반환, 아니면 갱신).
   useEffect(() => {
     let cancelled = false;
-    let timer: number | undefined;
-    const baseSec = Math.max(30, settings?.refreshIntervalSec ?? 300);
-    // 주기 폴링은 force=false — 백엔드 TTL 캐시/냉각이 실제 요청 빈도를 제어하게 한다.
-    // (수동 새로고침 버튼/F5만 force=true)
-    const schedule = (sec: number) => {
-      if (cancelled) return;
-      timer = window.setTimeout(() => run(false), sec * 1000);
-    };
-    const run = (force: boolean) => {
-      ipc
-        .getProviderUsage(activeTab, force)
-        .then((snap) => {
-          if (cancelled) return;
-          setSnapshots((s) => ({ ...s, [activeTab]: snap }));
-          // 레이트리밋이면 폴링 간격을 늘려 백오프한다(엔드포인트 회복 유도, 최대 15분).
-          const nextSec =
-            snap.response.status === "rate_limited" ? Math.min(baseSec * 4, 900) : baseSec;
-          schedule(nextSec);
-        })
-        .catch(() => schedule(baseSec));
-    };
-    run(false);
+    ipc
+      .getProviderUsage(activeTab, false)
+      .then((snap) => {
+        if (!cancelled) setSnapshots((s) => ({ ...s, [activeTab]: snap }));
+      })
+      .catch(() => {});
     return () => {
       cancelled = true;
-      if (timer !== undefined) clearTimeout(timer);
     };
-  }, [activeTab, settings?.refreshIntervalSec]);
+  }, [activeTab]);
 
   useEffect(() => {
     if (settings) {

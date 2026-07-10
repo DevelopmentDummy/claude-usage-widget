@@ -74,6 +74,9 @@ pub fn run() {
             let state = AppState::new(data_dir);
             app.manage(state.clone());
 
+            // 주기 폴링은 백엔드 tokio 타이머에서 구동한다(웹뷰 타이머 스로틀링 회피).
+            poller::spawn(app.handle().clone(), state.clone());
+
             let settings = state.settings.load();
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.set_always_on_top(settings.always_on_top);
