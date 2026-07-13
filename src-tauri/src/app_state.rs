@@ -18,6 +18,10 @@ use crate::types::{Provider, Status, UsageResponse};
 pub struct ProviderSnapshot {
     #[serde(rename = "fetchedAt")]
     pub fetched_at: String,
+    /// rate_limited일 때 다음 네트워크 요청이 허용되는 시각(rfc3339 = 쿨다운 종료).
+    /// 프론트가 "다음 요청 HH:MM"을 표시하는 데 쓴다.
+    #[serde(rename = "retryAt", default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<String>,
     pub response: UsageResponse,
 }
 
@@ -34,11 +38,25 @@ pub struct AppState {
     pub persisted: Mutex<PersistedState>,
     pub per_provider: Mutex<HashMap<Provider, ProviderSnapshot>>,
     /// 서버가 지정한 rate-limit 냉각 종료 시각(unix secs) — provider별.
+    /// state.json에 영속화되어 재시작 후에도 존중된다.
     cooldown_until: Mutex<HashMap<Provider, i64>>,
+    /// provider별 마지막 네트워크 시도 시각(unix secs) — force여도 최소 간격 하한을
+    /// 두어 버튼 연타/중복 이벤트 버스트가 한도를 터뜨리는 것을 막는다.
+    last_attempt: Mutex<HashMap<Provider, i64>>,
+    /// 프론트에서 현재 보고 있는 활성 provider — 폴러는 이 provider만 주기 갱신한다.
+    active_provider: Mutex<Provider>,
     /// provider별 in-flight 락 — 같은 순간 중복 네트워크 요청을 직렬화한다.
     fetch_locks: [Mutex<()>; 3],
     snapshot_path: PathBuf,
 }
+
+/// force=true여도 이 간격(초) 안에는 재요청하지 않는다.
+const MIN_FETCH_INTERVAL_SEC: i64 = 15;
+
+/// rate-limit 재요청 시 서버가 준 Retry-After에 더하는 여유 버퍼(초).
+/// 경계 정각에 딱 재요청하면 슬라이딩 윈도우/시계 오차로 또 429를 맞는 일이
+/// 많아, 조금 넘긴 뒤 재시도해 루프를 탈출할 확률을 높인다.
+const RETRY_BUFFER_SEC: i64 = 60;
 
 fn lock_index(p: Provider) -> usize {
     match p {
@@ -86,13 +104,22 @@ impl AppState {
                 }
             }
         }
+        // 영속화된 쿨다운을 복원한다(만료된 항목은 cooldown_snapshot에서 자연히 무시됨).
+        let mut cooldowns_init: HashMap<Provider, i64> = HashMap::new();
+        for (k, v) in &persisted.cooldowns {
+            if let Some(p) = provider_from_str(k) {
+                cooldowns_init.insert(p, *v);
+            }
+        }
         Arc::new(Self {
             cache: UsageCache::new(),
             settings: SettingsStore::new(app_data_dir),
             state,
             persisted: Mutex::new(persisted),
             per_provider: Mutex::new(loaded),
-            cooldown_until: Mutex::new(HashMap::new()),
+            cooldown_until: Mutex::new(cooldowns_init),
+            last_attempt: Mutex::new(HashMap::new()),
+            active_provider: Mutex::new(Provider::Claude),
             fetch_locks: [Mutex::new(()), Mutex::new(()), Mutex::new(())],
             snapshot_path,
         })
@@ -106,17 +133,48 @@ impl AppState {
             .collect()
     }
 
+    /// Ok 스냅샷만 디스크에 저장한다. 예전엔 맵 전체를 통째로 썼기 때문에
+    /// Codex/Gemini가 성공하는 순간 Claude의 rate_limited 스냅샷까지 같이
+    /// 디스크에 굳어, 재시작하면 "요청 제한" 배지가 그대로 살아나는 버그가 있었다.
     async fn persist_snapshots(&self) {
         let guard = self.per_provider.lock().await;
         let file = SnapshotFile {
             providers: guard
                 .iter()
+                .filter(|(_, v)| v.response.status == Status::Ok)
                 .map(|(k, v)| (k.as_str().to_string(), v.clone()))
                 .collect(),
         };
         drop(guard);
         if let Ok(bytes) = serde_json::to_vec_pretty(&file) {
             let _ = atomic_write(&self.snapshot_path, &bytes);
+        }
+    }
+
+    pub async fn set_active_provider(&self, provider: Provider) {
+        *self.active_provider.lock().await = provider;
+    }
+
+    pub async fn active_provider(&self) -> Provider {
+        *self.active_provider.lock().await
+    }
+
+    /// 현재 쿨다운 맵(미만료 항목만)을 state.json에 반영한다.
+    async fn sync_cooldowns_to_disk(&self) {
+        let now = chrono::Utc::now().timestamp();
+        let snapshot: HashMap<String, i64> = {
+            self.cooldown_until
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, &until)| until > now)
+                .map(|(p, v)| (p.as_str().to_string(), *v))
+                .collect()
+        };
+        let mut persisted = self.persisted.lock().await;
+        if persisted.cooldowns != snapshot {
+            persisted.cooldowns = snapshot;
+            let _ = self.state.save(&persisted);
         }
     }
 
@@ -179,6 +237,22 @@ impl AppState {
             }
         }
 
+        // force=true여도 최소 간격 하한을 둔다: 직전 시도가 너무 최근이면 캐시를 반환한다.
+        // (F5/헤더 새로고침/만료버튼 연타·중복 이벤트로 같은 provider에 요청이 몰려
+        //  민감한 usage 엔드포인트의 한도를 터뜨리는 것을 백엔드에서 차단)
+        let now = chrono::Utc::now().timestamp();
+        if force {
+            let last = self.last_attempt.lock().await.get(&provider).copied();
+            if let Some(t) = last {
+                if now - t < MIN_FETCH_INTERVAL_SEC {
+                    if let Some(s) = self.per_provider.lock().await.get(&provider).cloned() {
+                        return s;
+                    }
+                }
+            }
+        }
+        self.last_attempt.lock().await.insert(provider, now);
+
         let result = providers::fetch(provider).await;
         let retry_after = match &result {
             Err(AppError::RateLimited { retry_after }) => *retry_after,
@@ -189,14 +263,23 @@ impl AppState {
             Err(e) => error_to_response(provider, e),
         };
 
-        // 냉각 갱신: 레이트리밋이면 retry_after(없으면 5분, 1s~1h로 clamp)만큼 냉각, 성공이면 해제.
+        // 냉각 갱신: 레이트리밋이면 retry_after(없으면 5분, 1s~1h로 clamp) + 여유버퍼만큼
+        // 냉각, 성공이면 해제. retry_at(다음 요청 시각)도 버퍼 포함 값으로 표시된다.
+        let mut retry_at: Option<String> = None;
         match resp.status {
             Status::RateLimited => {
-                let secs = retry_after.unwrap_or(300).clamp(1, 3600) as i64;
-                self.cooldown_until.lock().await.insert(provider, now + secs);
+                let base = retry_after.unwrap_or(300).clamp(1, 3600) as i64;
+                let secs = base + RETRY_BUFFER_SEC;
+                let until = now + secs;
+                self.cooldown_until.lock().await.insert(provider, until);
+                self.sync_cooldowns_to_disk().await;
+                retry_at = chrono::DateTime::from_timestamp(until, 0).map(|dt| dt.to_rfc3339());
             }
             Status::Ok => {
-                self.cooldown_until.lock().await.remove(&provider);
+                let removed = self.cooldown_until.lock().await.remove(&provider).is_some();
+                if removed {
+                    self.sync_cooldowns_to_disk().await;
+                }
             }
             _ => {}
         }
@@ -221,6 +304,7 @@ impl AppState {
         };
         let snap = ProviderSnapshot {
             fetched_at,
+            retry_at,
             response: resp.clone(),
         };
         {

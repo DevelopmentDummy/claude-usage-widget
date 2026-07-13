@@ -21,14 +21,17 @@ pub fn spawn(app: AppHandle, state: Arc<AppState>) {
 }
 
 async fn tick(app: &AppHandle, state: &Arc<AppState>) {
-    // force=true: 예약 폴링은 프론트 주기와 백엔드 TTL이 같아 발생하던
-    // 경계 스킵을 피하기 위해 신선도 캐시를 우회한다. 서버가 지정한
-    // Retry-After 냉각(cooldown)은 fetch_one 내부에서 여전히 존중된다.
-    let results = state.fetch_all(true).await;
-    for (provider, snap) in results {
-        let _ = app.emit(
-            "usage:provider_updated",
-            ProviderUpdatedPayload { provider, snapshot: snap },
-        );
-    }
+    // 활성 탭 provider만 주기 갱신한다(README의 "활성 탭만 주기 조회" 동작).
+    // 예전엔 매 사이클 3개 provider를 전부 force 조회해서, Codex/Gemini를 보고
+    // 있어도 Claude가 계속 호출돼 usage 엔드포인트 한도를 갉아먹었다. 비활성
+    // provider는 디스크 스냅샷을 보여주고, 탭 전환 시 프론트가 직접 당겨온다.
+    //
+    // force=true: 프론트 주기와 백엔드 TTL이 같아 발생하던 경계 스킵을 피하려
+    // 신선도 캐시를 우회한다. Retry-After 냉각과 최소요청간격은 fetch_one이 존중.
+    let provider = state.active_provider().await;
+    let snap = state.fetch_one(provider, true).await;
+    let _ = app.emit(
+        "usage:provider_updated",
+        ProviderUpdatedPayload { provider, snapshot: snap },
+    );
 }

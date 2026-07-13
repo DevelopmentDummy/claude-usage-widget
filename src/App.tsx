@@ -27,6 +27,20 @@ const WIDTH_BY_MODE: Record<ViewMode, number> = {
 
 type SnapshotMap = Partial<Record<Provider, ProviderSnapshot>>;
 
+// 가로 스트립(super)용 축약 라벨: "HH:MM·N분".
+function shortRetry(retryAt?: string): string | null {
+  if (!retryAt) return null;
+  const t = new Date(retryAt).getTime();
+  if (Number.isNaN(t)) return null;
+  const hh = new Date(t).toLocaleTimeString("ko-KR", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const diffMin = Math.ceil((t - Date.now()) / 60000);
+  return diffMin > 0 ? `${hh}·${diffMin}분` : hh;
+}
+
 export default function App() {
   const [snapshots, setSnapshots] = useState<SnapshotMap>({});
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -155,6 +169,8 @@ export default function App() {
   // 한 번만 당겨온다(force=false — 신선하면 캐시 즉시 반환, 아니면 갱신).
   useEffect(() => {
     let cancelled = false;
+    // 백엔드 폴러가 활성 provider만 갱신하도록 현재 탭을 알린다.
+    ipc.setActiveProvider(activeTab).catch(() => {});
     ipc
       .getProviderUsage(activeTab, false)
       .then((snap) => {
@@ -310,6 +326,14 @@ export default function App() {
               {activeSnap?.response.status === "not_authenticated" ? "로그인 안됨" : "—"}
             </span>
           )}
+          {activeSnap?.response.status === "rate_limited" && activeSnap.retryAt && (
+            <span
+              className="flex-shrink-0 text-[9px] text-yellow-500/90 whitespace-nowrap"
+              title="요청 제한 — 다음 요청 시각"
+            >
+              ↻ {shortRetry(activeSnap.retryAt)}
+            </span>
+          )}
         </div>
         {menuOpen && settings && (
           <SettingsMenu settings={settings} onChange={setSettings} onClose={() => setMenuOpen(false)} />
@@ -339,7 +363,7 @@ export default function App() {
           style={compact ? { zoom: 0.75 } : undefined}
         >
           {!activeSnap && <div className="text-xs text-text-dim text-center py-4">로딩 중...</div>}
-          {activeSnap && <ProviderCard data={activeSnap.response} />}
+          {activeSnap && <ProviderCard data={activeSnap.response} retryAt={activeSnap.retryAt} />}
         </div>
       </div>
       <div

@@ -15,6 +15,11 @@ pub struct PersistedState {
     pub last_utilization: HashMap<String, f64>,
     #[serde(default)]
     pub last_updated_at: Option<String>,
+    /// provider str -> 429 Retry-After 냉각 종료 시각(unix secs).
+    /// 메모리 전용이던 쿨다운을 디스크에 남겨 재시작 시 유실을 막는다
+    /// (유실되면 부팅 즉시 재요청 → 또 429 → 벌점 누적).
+    #[serde(default)]
+    pub cooldowns: HashMap<String, i64>,
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -73,6 +78,8 @@ impl StateStore {
         let new_state = PersistedState {
             last_utilization: new_util,
             last_updated_at: Some(Utc::now().to_rfc3339()),
+            // 쿨다운은 fetch_one이 관리하므로 여기서는 그대로 보존한다.
+            cooldowns: prev.cooldowns.clone(),
         };
         (new_state, delta)
     }
@@ -142,5 +149,28 @@ mod tests {
         store.save(&s).unwrap();
         let loaded = store.load();
         assert_eq!(loaded.last_utilization["claude.five_hour"], 42.0);
+    }
+
+    #[test]
+    fn cooldowns_survive_save_load() {
+        let tmp = TempDir::new().unwrap();
+        let store = StateStore::new(tmp.path().to_path_buf());
+        let mut s = PersistedState::default();
+        s.cooldowns.insert("claude".into(), 1_800_000_000);
+        store.save(&s).unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.cooldowns.get("claude").copied(), Some(1_800_000_000));
+    }
+
+    #[test]
+    fn compute_and_update_preserves_cooldowns() {
+        let tmp = TempDir::new().unwrap();
+        let store = StateStore::new(tmp.path().to_path_buf());
+        let mut prev = PersistedState::default();
+        prev.cooldowns.insert("claude".into(), 1_800_000_000);
+        let current = vec![mk_resp(Provider::Codex, vec![("primary", 3.0)])];
+        let (new, _delta) = store.compute_and_update(&prev, &current);
+        // Codex 성공 갱신이 Claude 쿨다운을 지워버리지 않아야 한다.
+        assert_eq!(new.cooldowns.get("claude").copied(), Some(1_800_000_000));
     }
 }

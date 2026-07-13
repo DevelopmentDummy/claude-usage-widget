@@ -4,6 +4,8 @@ import type { Provider, Settings, UsageResponse } from "./types";
 
 export interface ProviderSnapshot {
   fetchedAt: string;
+  /** rate_limited일 때 다음 요청 허용 시각(rfc3339 = 쿨다운 종료). */
+  retryAt?: string;
   response: UsageResponse;
 }
 
@@ -24,6 +26,8 @@ export const ipc = {
     invoke<ProviderSnapshot>("get_provider_usage", { provider, force }),
   refreshAllInBackground: () => invoke<void>("refresh_all_in_background"),
   refreshViaCli: (provider: Provider) => invoke<void>("refresh_via_cli", { provider }),
+  setActiveProvider: (provider: Provider) =>
+    invoke<void>("set_active_provider", { provider }),
   getSettings: () => invoke<Settings>("get_settings"),
   saveSettings: (settings: Settings) => invoke<void>("save_settings", { settings }),
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),

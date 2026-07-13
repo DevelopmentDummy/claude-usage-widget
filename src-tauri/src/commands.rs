@@ -77,6 +77,15 @@ pub async fn refresh_via_cli(
 }
 
 #[tauri::command]
+pub async fn set_active_provider(
+    state: State<'_, Arc<AppState>>,
+    provider: Provider,
+) -> Result<(), String> {
+    state.set_active_provider(provider).await;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn get_settings(state: State<'_, Arc<AppState>>) -> Result<Settings, String> {
     Ok(state.settings.load())
 }

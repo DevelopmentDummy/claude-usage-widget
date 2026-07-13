@@ -177,6 +177,7 @@ pub fn run() {
             commands::get_provider_usage,
             commands::refresh_all_in_background,
             commands::refresh_via_cli,
+            commands::set_active_provider,
             commands::get_settings,
             commands::save_settings,
             commands::set_autostart,

@@ -33,10 +33,28 @@ function resolveLabel(data: UsageResponse): { label: string; loginCmd: string } 
     : { label: "Gemini", loginCmd: "gemini" };
 }
 
-export default function ProviderCard({ data }: { data: UsageResponse }) {
+// "다음 요청 HH:MM (N분 후)" — 쿨다운 종료(retryAt) 기준. 부모(App)가 1초마다
+// 리렌더하므로 상대 시간이 실시간으로 갱신된다.
+function formatRetry(retryAt?: string): string | null {
+  if (!retryAt) return null;
+  const t = new Date(retryAt).getTime();
+  if (Number.isNaN(t)) return null;
+  const hh = new Date(t).toLocaleTimeString("ko-KR", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const diffSec = Math.round((t - Date.now()) / 1000);
+  if (diffSec <= 0) return `다음 요청 ${hh} (곧)`;
+  if (diffSec < 60) return `다음 요청 ${hh} (${diffSec}초 후)`;
+  return `다음 요청 ${hh} (${Math.ceil(diffSec / 60)}분 후)`;
+}
+
+export default function ProviderCard({ data, retryAt }: { data: UsageResponse; retryAt?: string }) {
   const [refreshing, setRefreshing] = useState(false);
   const [cliError, setCliError] = useState<string | null>(null);
   const { label, loginCmd } = resolveLabel(data);
+  const retryLabel = data.status === "rate_limited" ? formatRetry(retryAt) : null;
 
   const triggerCliRefresh = async () => {
     setRefreshing(true);
@@ -57,7 +75,7 @@ export default function ProviderCard({ data }: { data: UsageResponse }) {
         <span className="inline-block w-2 h-2 rounded-full" style={{ backgroundColor: COLORS[data.provider] }} />
         <span className="text-xs text-text-dim">{label}</span>
         {data.status === "rate_limited" && (
-          <span title={data.error ?? "요청 제한"} className="text-[9px] px-1 py-[1px] rounded bg-yellow-500/20 text-yellow-500">제한됨</span>
+          <span title={retryLabel ?? data.error ?? "요청 제한"} className="text-[9px] px-1 py-[1px] rounded bg-yellow-500/20 text-yellow-500">제한됨</span>
         )}
         {data.status === "network_error" && (
           <span title={data.error} className="text-xs text-yellow-500">⚠</span>
@@ -95,7 +113,9 @@ export default function ProviderCard({ data }: { data: UsageResponse }) {
       ))}
 
       {data.status === "rate_limited" && data.windows.length > 0 && (
-        <div className="mt-1 text-[10px] text-yellow-500/80">요청 제한 — 마지막 값 표시 중</div>
+        <div className="mt-1 text-[10px] text-yellow-500/80">
+          요청 제한 — 마지막 값 표시 중{retryLabel ? ` · ${retryLabel}` : ""}
+        </div>
       )}
 
       {data.windows.length === 0 &&
