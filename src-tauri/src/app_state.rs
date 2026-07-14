@@ -254,34 +254,51 @@ impl AppState {
         self.last_attempt.lock().await.insert(provider, now);
 
         let result = providers::fetch(provider).await;
-        let retry_after = match &result {
-            Err(AppError::RateLimited { retry_after }) => *retry_after,
+        // primary가 429였는지(그리고 서버 Retry-After)를 폴백/쿨다운 판단용으로 먼저 기록.
+        let primary_retry_after = match &result {
+            Err(AppError::RateLimited { retry_after }) => Some(*retry_after),
             _ => None,
         };
+
+        // Claude 전용 폴백: primary(/api/oauth/usage)가 429로 튕기면 rate-limit 응답 헤더
+        // 방식(/v1/messages haiku 1회)으로 신선한 5시간/7일 수치를 확보한다. primary의
+        // Retry-After 쿨다운은 아래에서 그대로 설정되므로 이 폴백은 쿨다운당 최대 1회만 돈다.
+        let result = if provider == Provider::Claude && primary_retry_after.is_some() {
+            match providers::fetch_claude_ratelimit_headers().await {
+                Ok(fb) => {
+                    crate::diag::log("app_state", "claude primary 429 → ratelimit-header fallback ok");
+                    Ok(fb)
+                }
+                Err(e) => {
+                    crate::diag::log("app_state", &format!("claude fallback failed: {}", e));
+                    result
+                }
+            }
+        } else {
+            result
+        };
+
         let resp = match result {
             Ok(r) => r,
             Err(e) => error_to_response(provider, e),
         };
 
-        // 냉각 갱신: 레이트리밋이면 retry_after(없으면 5분, 1s~1h로 clamp) + 여유버퍼만큼
-        // 냉각, 성공이면 해제. retry_at(다음 요청 시각)도 버퍼 포함 값으로 표시된다.
+        // 냉각 갱신: primary가 429였으면(폴백 성공 여부와 무관하게) Retry-After+버퍼만큼 냉각.
+        // 폴백이 성공해 resp가 Ok여도 primary 쿨다운은 유지해 throttle된 엔드포인트를 덜 때린다.
+        // 성공이면 해제. retry_at(다음 primary 시도 시각)도 버퍼 포함 값으로 표시된다.
         let mut retry_at: Option<String> = None;
-        match resp.status {
-            Status::RateLimited => {
-                let base = retry_after.unwrap_or(300).clamp(1, 3600) as i64;
-                let secs = base + RETRY_BUFFER_SEC;
-                let until = now + secs;
-                self.cooldown_until.lock().await.insert(provider, until);
+        if let Some(ra) = primary_retry_after {
+            let base = ra.unwrap_or(300).clamp(1, 3600) as i64;
+            let secs = base + RETRY_BUFFER_SEC;
+            let until = now + secs;
+            self.cooldown_until.lock().await.insert(provider, until);
+            self.sync_cooldowns_to_disk().await;
+            retry_at = chrono::DateTime::from_timestamp(until, 0).map(|dt| dt.to_rfc3339());
+        } else if resp.status == Status::Ok {
+            let removed = self.cooldown_until.lock().await.remove(&provider).is_some();
+            if removed {
                 self.sync_cooldowns_to_disk().await;
-                retry_at = chrono::DateTime::from_timestamp(until, 0).map(|dt| dt.to_rfc3339());
             }
-            Status::Ok => {
-                let removed = self.cooldown_until.lock().await.remove(&provider).is_some();
-                if removed {
-                    self.sync_cooldowns_to_disk().await;
-                }
-            }
-            _ => {}
         }
 
         // 일시적 오류(레이트리밋/네트워크)면 마지막 정상 수치와 시각을 유지해

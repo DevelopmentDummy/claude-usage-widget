@@ -229,6 +229,125 @@ pub async fn fetch() -> AppResult<UsageResponse> {
     }
 }
 
+// ---- rate-limit 헤더 폴백 -------------------------------------------------
+// primary(/api/oauth/usage)가 429로 튕길 때 사용하는 대체 경로.
+// /v1/messages에 haiku로 최소 호출(1토큰)을 하면 응답에 `anthropic-ratelimit-unified-*`
+// 헤더로 5시간/7일 사용률·리셋 시각이 붙어온다. 그 throttle된 엔드포인트를 우회한다.
+const OAUTH_BETA: &str = "oauth-2025-04-20";
+const FALLBACK_MODEL: &str = "claude-haiku-4-5"; // 날짜 없는 별칭 — 최신 스냅샷 자동 resolve
+
+fn header_f64(h: &reqwest::header::HeaderMap, name: &str) -> Option<f64> {
+    h.get(name)?.to_str().ok()?.trim().parse::<f64>().ok()
+}
+fn header_i64(h: &reqwest::header::HeaderMap, name: &str) -> Option<i64> {
+    h.get(name)?.to_str().ok()?.trim().parse::<i64>().ok()
+}
+fn reset_to_rfc3339(unix: Option<i64>) -> Option<String> {
+    unix.and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|d| d.to_rfc3339())
+}
+
+fn windows_from_unified_headers(h: &reqwest::header::HeaderMap) -> Vec<UsageWindow> {
+    let mut windows = Vec::new();
+    if let Some(u) = header_f64(h, "anthropic-ratelimit-unified-5h-utilization") {
+        let reset = reset_to_rfc3339(header_i64(h, "anthropic-ratelimit-unified-5h-reset"));
+        windows.push(window_from_reset(
+            "five_hour".into(), "5시간".into(), (u * 100.0).round(), reset.as_deref(), HOUR5,
+        ));
+    }
+    if let Some(u) = header_f64(h, "anthropic-ratelimit-unified-7d-utilization") {
+        let reset = reset_to_rfc3339(header_i64(h, "anthropic-ratelimit-unified-7d-reset"));
+        windows.push(window_from_reset(
+            "seven_day".into(), "7일".into(), (u * 100.0).round(), reset.as_deref(), DAY7,
+        ));
+    }
+    windows
+}
+
+async fn probe(client: &reqwest::Client, token: &str, model: &str) -> AppResult<reqwest::Response> {
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let res = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", OAUTH_BETA)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await?;
+    Ok(res)
+}
+
+/// FALLBACK_MODEL이 은퇴(404)했을 때 /v1/models에서 haiku id를 동적 탐색한다.
+async fn discover_haiku_model(client: &reqwest::Client, token: &str) -> Option<String> {
+    let res = client
+        .get("https://api.anthropic.com/v1/models?limit=100")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", OAUTH_BETA)
+        .send()
+        .await
+        .ok()?;
+    if !res.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = res.json().await.ok()?;
+    let mut ids: Vec<String> = v
+        .get("data")?
+        .as_array()?
+        .iter()
+        .filter_map(|m| m.get("id").and_then(|x| x.as_str()))
+        .filter(|s| s.contains("haiku"))
+        .map(|s| s.to_string())
+        .collect();
+    ids.sort(); // 사전식 최대 ≈ 최신 세대/스냅샷
+    ids.pop()
+}
+
+pub async fn fetch_ratelimit_headers() -> AppResult<UsageResponse> {
+    let token = read_token()?;
+    let client = reqwest::Client::new();
+    let mut res = probe(&client, &token, FALLBACK_MODEL).await?;
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        if let Some(m) = discover_haiku_model(&client, &token).await {
+            crate::diag::log("claude", &format!("fallback: {} is 404, discovered {}", FALLBACK_MODEL, m));
+            res = probe(&client, &token, &m).await?;
+        }
+    }
+    let status = res.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(AppError::Expired);
+    }
+    // 429여도 unified 헤더는 함께 오므로 헤더부터 파싱한다.
+    let windows = windows_from_unified_headers(res.headers());
+    if windows.is_empty() {
+        let code = status.as_u16();
+        let body = res.text().await.unwrap_or_default();
+        crate::diag::log(
+            "claude",
+            &format!("fallback: no unified headers status={} body={}", code, body.chars().take(200).collect::<String>()),
+        );
+        if code == 429 {
+            return Err(AppError::RateLimited { retry_after: None });
+        }
+        return Err(AppError::Api { status: code, message: body });
+    }
+    crate::diag::log(
+        "claude",
+        &format!("fallback ok: {} windows via unified headers (status={})", windows.len(), status.as_u16()),
+    );
+    Ok(UsageResponse {
+        provider: Provider::Claude,
+        status: Status::Ok,
+        windows,
+        extra_usage: None,
+        error: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +434,28 @@ mod tests {
         let far = "2099-01-01T00:00:00Z";
         let tp = compute_time_progress(far, 5 * 60 * 60);
         assert_eq!(tp, 0.0);
+    }
+
+    #[test]
+    fn unified_headers_map_to_5h_7d_windows() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        h.insert("anthropic-ratelimit-unified-5h-utilization", HeaderValue::from_static("0.23"));
+        h.insert("anthropic-ratelimit-unified-5h-reset", HeaderValue::from_static("4102444800"));
+        h.insert("anthropic-ratelimit-unified-7d-utilization", HeaderValue::from_static("0.58"));
+        h.insert("anthropic-ratelimit-unified-7d-reset", HeaderValue::from_static("4102444800"));
+        let w = windows_from_unified_headers(&h);
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].key, "five_hour");
+        assert_eq!(w[0].utilization, 23.0);
+        assert_eq!(w[1].key, "seven_day");
+        assert_eq!(w[1].utilization, 58.0);
+        assert!(!w[0].resets_at.is_empty());
+    }
+
+    #[test]
+    fn unified_headers_empty_when_absent() {
+        let h = reqwest::header::HeaderMap::new();
+        assert!(windows_from_unified_headers(&h).is_empty());
     }
 }

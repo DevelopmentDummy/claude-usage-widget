@@ -13,3 +13,8 @@ pub async fn fetch(provider: Provider) -> AppResult<UsageResponse> {
         Provider::Gemini => gemini::fetch().await,
     }
 }
+
+/// Claude primary(/api/oauth/usage)가 429일 때 쓰는 rate-limit 헤더 폴백.
+pub async fn fetch_claude_ratelimit_headers() -> AppResult<UsageResponse> {
+    claude::fetch_ratelimit_headers().await
+}
