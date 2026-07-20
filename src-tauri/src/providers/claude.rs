@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use crate::errors::{AppError, AppResult};
-use crate::types::{Provider, Status, UsageResponse, UsageWindow};
+use crate::types::{ExtraUsage, Provider, Status, UsageResponse, UsageWindow};
 
 #[derive(Deserialize)]
 struct Creds {
@@ -43,6 +43,24 @@ pub(crate) struct RawLimit {
     pub scope: Option<RawScope>,
 }
 
+/// 추가 사용(extra usage) 원본. 금액은 **최소 화폐 단위 정수**로 온다
+/// (USD면 센트: `used_credits: 14306` = $143.06). `decimal_places`로 나눠야 실제 금액이다.
+/// 필드가 하나라도 빠져도 전체 파싱이 죽지 않도록 전부 `default`.
+#[derive(Deserialize, Default)]
+pub(crate) struct RawExtraUsage {
+    #[serde(default)]
+    pub is_enabled: bool,
+    #[serde(default)]
+    pub monthly_limit: f64,
+    #[serde(default)]
+    pub used_credits: f64,
+    #[serde(default)]
+    pub utilization: Option<f64>,
+    /// 소수 자릿수. USD=2. 미제공 시 2로 가정한다.
+    #[serde(default)]
+    pub decimal_places: Option<u32>,
+}
+
 #[derive(Deserialize, Default)]
 pub(crate) struct RawUsage {
     pub five_hour: Option<RawWindow>,
@@ -51,6 +69,7 @@ pub(crate) struct RawUsage {
     pub seven_day_opus: Option<RawWindow>,
     pub seven_day_cowork: Option<RawWindow>,
     pub limits: Option<Vec<RawLimit>>,
+    pub extra_usage: Option<RawExtraUsage>,
 }
 
 fn credentials_path() -> PathBuf {
@@ -128,6 +147,19 @@ fn windows_from_limits(limits: &[RawLimit]) -> Vec<UsageWindow> {
     windows
 }
 
+/// API가 주는 최소 화폐 단위 정수를 실제 금액으로 환산한다.
+/// 이 변환을 빠뜨리면 USD 기준 100배로 부풀려 표시된다 ($143.06 → $14306.00).
+fn map_extra_usage(raw: &RawUsage) -> Option<ExtraUsage> {
+    let e = raw.extra_usage.as_ref()?;
+    let divisor = 10f64.powi(e.decimal_places.unwrap_or(2) as i32);
+    Some(ExtraUsage {
+        is_enabled: e.is_enabled,
+        monthly_limit: e.monthly_limit / divisor,
+        used_credits: e.used_credits / divisor,
+        utilization: e.utilization,
+    })
+}
+
 pub(crate) fn map_raw_to_response(raw: &RawUsage) -> UsageResponse {
     if let Some(limits) = &raw.limits {
         let windows = windows_from_limits(limits);
@@ -136,7 +168,7 @@ pub(crate) fn map_raw_to_response(raw: &RawUsage) -> UsageResponse {
                 provider: Provider::Claude,
                 status: Status::Ok,
                 windows,
-                extra_usage: None,
+                extra_usage: map_extra_usage(raw),
                 error: None,
             };
         }
@@ -165,7 +197,7 @@ pub(crate) fn map_raw_to_response(raw: &RawUsage) -> UsageResponse {
         provider: Provider::Claude,
         status: Status::Ok,
         windows,
-        extra_usage: None,
+        extra_usage: map_extra_usage(raw),
         error: None,
     }
 }
@@ -427,6 +459,51 @@ mod tests {
         let resp = map_raw_to_response(&raw);
         assert_eq!(resp.windows.len(), 1);
         assert_eq!(resp.windows[0].key, "seven_day");
+    }
+
+    #[test]
+    fn extra_usage_is_converted_from_minor_units() {
+        // 2026-07-21 실제 응답. 금액은 센트 정수이므로 decimal_places(2)로 나눠야 한다.
+        let body = r#"{
+            "limits": [
+                {"kind":"session","group":"session","percent":25,"resets_at":"2030-01-01T00:00:00Z","scope":null}
+            ],
+            "extra_usage": {
+                "is_enabled": true,
+                "monthly_limit": 20000,
+                "used_credits": 14306,
+                "utilization": 71.53,
+                "currency": "USD",
+                "decimal_places": 2
+            }
+        }"#;
+        let raw: RawUsage = serde_json::from_str(body).unwrap();
+        let resp = map_raw_to_response(&raw);
+        let extra = resp.extra_usage.expect("extra_usage should be mapped");
+        assert!(extra.is_enabled);
+        assert_eq!(extra.used_credits, 143.06);
+        assert_eq!(extra.monthly_limit, 200.0);
+        // API가 준 utilization과 환산값 비율이 일치해야 한다 (같은 스케일 교차검증)
+        assert!((extra.used_credits / extra.monthly_limit * 100.0 - 71.53).abs() < 0.01);
+    }
+
+    #[test]
+    fn extra_usage_defaults_to_two_decimal_places() {
+        let body = r#"{
+            "five_hour": {"utilization": 42.0, "resets_at": "2030-01-01T00:00:00Z"},
+            "extra_usage": {"is_enabled": true, "monthly_limit": 5000, "used_credits": 250, "utilization": 5.0}
+        }"#;
+        let raw: RawUsage = serde_json::from_str(body).unwrap();
+        let extra = map_raw_to_response(&raw).extra_usage.unwrap();
+        assert_eq!(extra.used_credits, 2.5);
+        assert_eq!(extra.monthly_limit, 50.0);
+    }
+
+    #[test]
+    fn extra_usage_absent_stays_none() {
+        let body = r#"{"five_hour": {"utilization": 42.0, "resets_at": "2030-01-01T00:00:00Z"}}"#;
+        let raw: RawUsage = serde_json::from_str(body).unwrap();
+        assert!(map_raw_to_response(&raw).extra_usage.is_none());
     }
 
     #[test]
