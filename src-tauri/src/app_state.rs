@@ -43,6 +43,9 @@ pub struct AppState {
     /// provider별 마지막 네트워크 시도 시각(unix secs) — force여도 최소 간격 하한을
     /// 두어 버튼 연타/중복 이벤트 버스트가 한도를 터뜨리는 것을 막는다.
     last_attempt: Mutex<HashMap<Provider, i64>>,
+    /// provider별 마지막 CLI 자동 토큰 갱신 시각(unix secs).
+    /// 401이 연속으로 나도 CLI를 매번 스폰하지 않도록 하한 간격을 둔다.
+    last_auto_refresh: Mutex<HashMap<Provider, i64>>,
     /// 프론트에서 현재 보고 있는 활성 provider — 폴러는 이 provider만 주기 갱신한다.
     active_provider: Mutex<Provider>,
     /// provider별 in-flight 락 — 같은 순간 중복 네트워크 요청을 직렬화한다.
@@ -57,6 +60,9 @@ const MIN_FETCH_INTERVAL_SEC: i64 = 15;
 /// 경계 정각에 딱 재요청하면 슬라이딩 윈도우/시계 오차로 또 429를 맞는 일이
 /// 많아, 조금 넘긴 뒤 재시도해 루프를 탈출할 확률을 높인다.
 const RETRY_BUFFER_SEC: i64 = 60;
+
+/// CLI 자동 토큰 갱신의 최소 재시도 간격(초).
+const AUTO_REFRESH_MIN_INTERVAL_SEC: i64 = 300;
 
 fn lock_index(p: Provider) -> usize {
     match p {
@@ -119,6 +125,7 @@ impl AppState {
             per_provider: Mutex::new(loaded),
             cooldown_until: Mutex::new(cooldowns_init),
             last_attempt: Mutex::new(HashMap::new()),
+            last_auto_refresh: Mutex::new(HashMap::new()),
             active_provider: Mutex::new(Provider::Claude),
             fetch_locks: [Mutex::new(()), Mutex::new(()), Mutex::new(())],
             snapshot_path,
@@ -209,15 +216,51 @@ impl AppState {
         }
     }
 
+    /// CLI(`claude -p ...`)를 스폰해 만료된 OAuth 토큰을 갱신한다.
+    /// AUTO_REFRESH_MIN_INTERVAL_SEC 안에 이미 시도했으면 건너뛴다.
+    /// 반환값 = "이번에 갱신에 성공했다"(재시도할 가치가 있음).
+    async fn try_auto_refresh(&self, provider: Provider) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut guard = self.last_auto_refresh.lock().await;
+            if let Some(t) = guard.get(&provider) {
+                if now - *t < AUTO_REFRESH_MIN_INTERVAL_SEC {
+                    return false;
+                }
+            }
+            guard.insert(provider, now);
+        }
+        crate::diag::log(
+            "app_state",
+            &format!("token expired → auto cli refresh provider={}", provider.as_str()),
+        );
+        match crate::cli_refresher::refresh_via_cli(provider).await {
+            Ok(()) => {
+                crate::diag::log("app_state", "auto cli refresh ok");
+                true
+            }
+            Err(e) => {
+                crate::diag::log("app_state", &format!("auto cli refresh failed: {}", e));
+                false
+            }
+        }
+    }
+
     pub async fn fetch_one(&self, provider: Provider, force: bool) -> ProviderSnapshot {
         let ttl = self.settings.load().refresh_interval_sec as i64;
         let now = chrono::Utc::now().timestamp();
 
-        // 서버가 지정한 냉각(Retry-After) 중이면 네트워크를 절대 치지 않는다.
+        // 서버가 지정한 냉각(Retry-After) 중이면 primary를 절대 치지 않는다.
         // force(수동 새로고침)여도 존중한다 — 냉각 중 재요청은 429만 늘리고 서버 타이머를
         // 리셋시켜 오히려 복구를 지연시키기 때문.
+        // 단 Claude는 냉각 중에도 캐시가 낡았으면 rate-limit 헤더 폴백(다른 엔드포인트)으로
+        // 계속 갱신한다 — 이게 "제한 걸리면 임시 라우팅"의 핵심이다.
+        let mut cooldown_active = false;
         if let Some(s) = self.cooldown_snapshot(provider, now).await {
-            return s;
+            if provider != Provider::Claude || self.fresh(&s, ttl) {
+                return s;
+            }
+            cooldown_active = true;
         }
         if !force {
             if let Some(s) = self.fresh_snapshot(provider, ttl).await {
@@ -229,7 +272,10 @@ impl AppState {
         let _flight = self.fetch_locks[lock_index(provider)].lock().await;
         // 락을 기다리는 사이 다른 호출이 이미 갱신/냉각시켰을 수 있으니 재확인.
         if let Some(s) = self.cooldown_snapshot(provider, now).await {
-            return s;
+            if provider != Provider::Claude || self.fresh(&s, ttl) {
+                return s;
+            }
+            cooldown_active = true;
         }
         if !force {
             if let Some(s) = self.fresh_snapshot(provider, ttl).await {
@@ -253,20 +299,46 @@ impl AppState {
         }
         self.last_attempt.lock().await.insert(provider, now);
 
-        let result = providers::fetch(provider).await;
+        // 토큰이 이미 만료(임박)면 요청 전에 CLI로 선제 갱신한다.
+        // 만료 토큰으로 usage를 치면 401이 아니라 429가 돌아오는 경우가 있어,
+        // 그대로 두면 "429 → 폴백 → 401" 루프에 1시간씩 갇힌다.
+        if provider == Provider::Claude && providers::claude::token_expired() {
+            self.try_auto_refresh(provider).await;
+        }
+
+        // 냉각 중이면 primary는 건너뛰고 폴백 경로만 탄다.
+        let result = if cooldown_active {
+            Err(AppError::RateLimited { retry_after: None })
+        } else {
+            let mut r = providers::fetch(provider).await;
+            // 401(Expired)이면 CLI로 토큰을 갱신하고 1회 재시도.
+            if matches!(r, Err(AppError::Expired)) && self.try_auto_refresh(provider).await {
+                r = providers::fetch(provider).await;
+            }
+            r
+        };
         // primary가 429였는지(그리고 서버 Retry-After)를 폴백/쿨다운 판단용으로 먼저 기록.
-        let primary_retry_after = match &result {
-            Err(AppError::RateLimited { retry_after }) => Some(*retry_after),
+        // 냉각 중이라 primary를 아예 안 쳤으면 쿨다운을 새로 걸지 않는다(기존 쿨다운 유지).
+        let primary_retry_after = match (&result, cooldown_active) {
+            (Err(AppError::RateLimited { retry_after }), false) => Some(*retry_after),
             _ => None,
         };
 
-        // Claude 전용 폴백: primary(/api/oauth/usage)가 429로 튕기면 rate-limit 응답 헤더
-        // 방식(/v1/messages haiku 1회)으로 신선한 5시간/7일 수치를 확보한다. primary의
-        // Retry-After 쿨다운은 아래에서 그대로 설정되므로 이 폴백은 쿨다운당 최대 1회만 돈다.
-        let result = if provider == Provider::Claude && primary_retry_after.is_some() {
-            match providers::fetch_claude_ratelimit_headers().await {
+        // Claude 전용 폴백: primary(/api/oauth/usage)가 429로 튕기거나 냉각 중이면 rate-limit
+        // 응답 헤더 방식(/v1/messages haiku 1회)으로 신선한 5시간/7일 수치를 확보한다.
+        // 냉각 중에도 이 경로는 살아 있어야 게이지가 얼지 않는다(TTL마다 1회).
+        let use_fallback = provider == Provider::Claude
+            && (cooldown_active || primary_retry_after.is_some());
+        let result = if use_fallback {
+            let mut fb_result = providers::fetch_claude_ratelimit_headers().await;
+            // 폴백이 401이면 토큰이 죽은 것 — CLI로 갱신하고 폴백만 1회 재시도한다.
+            // (primary는 쿨다운 중이므로 다시 치지 않는다.)
+            if matches!(fb_result, Err(AppError::Expired)) && self.try_auto_refresh(provider).await {
+                fb_result = providers::fetch_claude_ratelimit_headers().await;
+            }
+            match fb_result {
                 Ok(fb) => {
-                    crate::diag::log("app_state", "claude primary 429 → ratelimit-header fallback ok");
+                    crate::diag::log("app_state", "claude ratelimit-header fallback ok");
                     Ok(fb)
                 }
                 Err(e) => {
@@ -294,6 +366,17 @@ impl AppState {
             self.cooldown_until.lock().await.insert(provider, until);
             self.sync_cooldowns_to_disk().await;
             retry_at = chrono::DateTime::from_timestamp(until, 0).map(|dt| dt.to_rfc3339());
+        } else if cooldown_active {
+            // 폴백으로 값은 갱신했지만 primary 쿨다운은 그대로 유지한다.
+            // 여기서 해제하면 다음 주기에 다시 primary를 쳐서 429를 재생산한다.
+            retry_at = self
+                .cooldown_until
+                .lock()
+                .await
+                .get(&provider)
+                .copied()
+                .and_then(|until| chrono::DateTime::from_timestamp(until, 0))
+                .map(|dt| dt.to_rfc3339());
         } else if resp.status == Status::Ok {
             let removed = self.cooldown_until.lock().await.remove(&provider).is_some();
             if removed {

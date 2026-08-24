@@ -15,6 +15,9 @@ struct Creds {
 struct OauthBlock {
     #[serde(rename = "accessToken")]
     access_token: String,
+    /// 만료 시각(unix **밀리초**). 없으면 만료 판정을 하지 않는다.
+    #[serde(rename = "expiresAt", default)]
+    expires_at: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +86,29 @@ fn read_token() -> AppResult<String> {
     let creds: Creds = serde_json::from_str(&raw)
         .map_err(|_| AppError::NotAuthenticated("claude credentials malformed".into()))?;
     Ok(creds.claude_ai_oauth.access_token)
+}
+
+/// 토큰 만료 여유(초). 이 안쪽이면 "곧 만료"로 보고 선제 갱신한다.
+const TOKEN_SKEW_SEC: i64 = 120;
+
+/// .credentials.json의 expiresAt 기준으로 토큰이 만료(임박)인지 판단한다.
+/// 파일이 없거나 expiresAt이 없으면 false(판단 불가 → 그냥 요청).
+///
+/// usage 엔드포인트는 만료 토큰에도 401 대신 429를 주는 경우가 있어,
+/// "429 → 폴백 → 401(token expired)" 루프에 갇힌다. 그래서 요청 전에 미리 본다.
+pub fn token_expired() -> bool {
+    let raw = match std::fs::read_to_string(credentials_path()) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let creds: Creds = match serde_json::from_str(&raw) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    match creds.claude_ai_oauth.expires_at {
+        Some(ms) => chrono::Utc::now().timestamp() >= ms / 1000 - TOKEN_SKEW_SEC,
+        None => false,
+    }
 }
 
 const WIN_DEFS: &[(&str, &str, u64)] = &[
@@ -351,6 +377,7 @@ pub async fn fetch_ratelimit_headers() -> AppResult<UsageResponse> {
     }
     let status = res.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
+        crate::diag::log("claude", "fallback: 401 unauthorized -> Expired");
         return Err(AppError::Expired);
     }
     // 429여도 unified 헤더는 함께 오므로 헤더부터 파싱한다.
