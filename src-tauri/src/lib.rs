@@ -78,6 +78,9 @@ pub fn run() {
             poller::spawn(app.handle().clone(), state.clone());
 
             let settings = state.settings.load();
+            // 자동시작 등록 경로를 지금 실행 중인 exe로 맞춘다(옛 경로 고착 방지).
+            autostart::sync(settings.autostart);
+
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.set_always_on_top(settings.always_on_top);
                 let _ = win.set_size(tauri::Size::Logical(tauri::LogicalSize {
