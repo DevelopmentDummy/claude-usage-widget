@@ -75,7 +75,16 @@ fn push_window(out: &mut Vec<UsageWindow>, key: &str, pw: &PrimaryOrSecondary) {
 
 pub(crate) fn map_to_response(result: &RateLimitsResult) -> UsageResponse {
     let mut windows = Vec::new();
-    let mut buckets: Vec<&Bucket> = result.rate_limits_by_limit_id.values().collect();
+    // Recent Pro responses expose additional model-specific and reserve buckets
+    // alongside the account's canonical `codex` allowance.  Those are internal
+    // sub-limits, not separate subscription allowances, and rendering all of them
+    // produces several indistinguishable "7일" gauges.  Prefer the canonical
+    // account bucket when present, while retaining the old all-buckets behavior
+    // for older/alternate response shapes that do not provide it.
+    let mut buckets: Vec<&Bucket> = match result.rate_limits_by_limit_id.get("codex") {
+        Some(codex) => vec![codex],
+        None => result.rate_limits_by_limit_id.values().collect(),
+    };
     buckets.sort_by_key(|b| b.limit_id.clone().unwrap_or_default());
     for b in buckets {
         let base = b.limit_id.clone().unwrap_or_else(|| "unknown".into());
@@ -211,5 +220,53 @@ mod tests {
         assert_eq!(resp.windows.len(), 2);
         assert_eq!(resp.windows[0].name, "5시간");
         assert_eq!(resp.windows[1].name, "7일");
+    }
+
+    #[test]
+    fn canonical_codex_bucket_hides_model_specific_and_reserve_limits() {
+        fn weekly_bucket(id: &str, used_percent: f64) -> Bucket {
+            Bucket {
+                limit_id: Some(id.into()),
+                limit_name: None,
+                primary: Some(PrimaryOrSecondary {
+                    used_percent: Some(used_percent),
+                    window_duration_mins: Some(10_080),
+                    resets_at: Some(4_000_000_000),
+                }),
+                secondary: None,
+            }
+        }
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("codex".into(), weekly_bucket("codex", 9.0));
+        map.insert(
+            "base_model_inference".into(),
+            weekly_bucket("base_model_inference", 0.0),
+        );
+        map.insert(
+            "codex_bengalfox".into(),
+            Bucket {
+                limit_id: Some("codex_bengalfox".into()),
+                limit_name: Some("GPT-5.3-Codex-Spark".into()),
+                primary: Some(PrimaryOrSecondary {
+                    used_percent: Some(0.0),
+                    window_duration_mins: Some(300),
+                    resets_at: Some(4_000_000_000),
+                }),
+                secondary: Some(PrimaryOrSecondary {
+                    used_percent: Some(0.0),
+                    window_duration_mins: Some(10_080),
+                    resets_at: Some(4_000_000_000),
+                }),
+            },
+        );
+
+        let result = RateLimitsResult { rate_limits_by_limit_id: map };
+        let resp = map_to_response(&result);
+
+        assert_eq!(resp.windows.len(), 1);
+        assert_eq!(resp.windows[0].key, "codex_primary");
+        assert_eq!(resp.windows[0].name, "7일");
+        assert_eq!(resp.windows[0].utilization, 9.0);
     }
 }
