@@ -215,9 +215,9 @@ mod tests {
     fn maps_primary_and_secondary() {
         let mut map = std::collections::HashMap::new();
         map.insert(
-            "plan-a".to_string(),
+            "codex".to_string(),
             Bucket {
-                limit_id: Some("plan-a".into()),
+                limit_id: Some("codex".into()),
                 limit_name: Some("Plan A".into()),
                 primary: Some(PrimaryOrSecondary {
                     used_percent: Some(20.0),
@@ -234,8 +234,8 @@ mod tests {
         let result = RateLimitsResult { rate_limits_by_limit_id: map };
         let resp = map_to_response(&result);
         assert_eq!(resp.windows.len(), 2);
-        assert_eq!(resp.windows[0].name, "5시간 (Plan A)");
-        assert_eq!(resp.windows[1].name, "7일 (Plan A)");
+        assert_eq!(resp.windows[0].name, "5시간 (Codex 전체)");
+        assert_eq!(resp.windows[1].name, "7일 (Codex 전체)");
     }
 
     #[test]
