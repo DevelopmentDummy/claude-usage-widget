@@ -88,8 +88,7 @@ fn push_window(out: &mut Vec<UsageWindow>, key: &str, label: &str, pw: &PrimaryO
 
 pub(crate) fn map_to_response(result: &RateLimitsResult) -> UsageResponse {
     let mut windows = Vec::new();
-    let mut buckets: Vec<&Bucket> = result.rate_limits_by_limit_id.values().collect();
-    buckets.sort_by_key(|b| b.limit_id.clone().unwrap_or_default());
+    let buckets: Vec<&Bucket> = result.rate_limits_by_limit_id.get("codex").into_iter().collect();
     for b in buckets {
         let base = b.limit_id.clone().unwrap_or_else(|| "unknown".into());
         let label = bucket_label(b);
@@ -102,6 +101,18 @@ pub(crate) fn map_to_response(result: &RateLimitsResult) -> UsageResponse {
         windows,
         extra_usage: None,
         error: None,
+    }
+}
+
+/// Older persisted snapshots may still contain model-specific buckets. Keep
+/// startup display consistent with fresh responses and upgrade the old label.
+pub(crate) fn normalize_cached_response(response: &mut UsageResponse) {
+    response.windows.retain(|w| {
+        matches!(w.key.as_str(), "codex_primary" | "codex_secondary")
+    });
+    for window in &mut response.windows {
+        let duration = window.name.split(" (").next().unwrap_or(&window.name);
+        window.name = format!("{} (Codex 전체)", duration);
     }
 }
 
@@ -228,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn labels_canonical_model_specific_and_reserve_limits() {
+    fn hides_model_specific_and_reserve_limits() {
         fn weekly_bucket(id: &str, used_percent: f64) -> Bucket {
             Bucket {
                 limit_id: Some(id.into()),
@@ -269,10 +280,39 @@ mod tests {
         let result = RateLimitsResult { rate_limits_by_limit_id: map };
         let resp = map_to_response(&result);
 
-        assert_eq!(resp.windows.len(), 4);
-        assert_eq!(resp.windows[0].name, "7일 (GPT 예비)");
-        assert_eq!(resp.windows[1].name, "7일 (Codex 전체)");
-        assert_eq!(resp.windows[2].name, "5시간 (Spark)");
-        assert_eq!(resp.windows[3].name, "7일 (Spark)");
+        assert_eq!(resp.windows.len(), 1);
+        assert_eq!(resp.windows[0].name, "7일 (Codex 전체)");
+        assert_eq!(resp.windows[0].key, "codex_primary");
+    }
+
+    #[test]
+    fn normalizes_old_cached_response() {
+        let mut response = UsageResponse {
+            provider: Provider::Codex,
+            status: Status::Ok,
+            windows: vec![
+                UsageWindow {
+                    key: "codex_primary".into(),
+                    name: "7일".into(),
+                    utilization: 22.0,
+                    resets_at: "2030-01-01T00:00:00Z".into(),
+                    time_progress: 1.0,
+                },
+                UsageWindow {
+                    key: "codex_bengalfox_primary".into(),
+                    name: "5시간 (Spark)".into(),
+                    utilization: 0.0,
+                    resets_at: "2030-01-01T00:00:00Z".into(),
+                    time_progress: 1.0,
+                },
+            ],
+            extra_usage: None,
+            error: None,
+        };
+
+        normalize_cached_response(&mut response);
+
+        assert_eq!(response.windows.len(), 1);
+        assert_eq!(response.windows[0].name, "7일 (Codex 전체)");
     }
 }

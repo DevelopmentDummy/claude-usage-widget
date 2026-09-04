@@ -103,8 +103,11 @@ impl AppState {
         let mut loaded: HashMap<Provider, ProviderSnapshot> = HashMap::new();
         if let Ok(raw) = fs::read_to_string(&snapshot_path) {
             if let Ok(file) = serde_json::from_str::<SnapshotFile>(&raw) {
-                for (k, v) in file.providers {
+                for (k, mut v) in file.providers {
                     if let Some(p) = provider_from_str(&k) {
+                        if p == Provider::Codex {
+                            providers::codex::normalize_cached_response(&mut v.response);
+                        }
                         loaded.insert(p, v);
                     }
                 }
