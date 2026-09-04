@@ -18,6 +18,45 @@ use tauri::{
     Manager, WindowEvent,
 };
 
+#[cfg(windows)]
+fn refresh_borderless_frame(window: &tauri::Window) {
+    use windows_sys::Win32::{
+        Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW},
+        UI::WindowsAndMessaging::{
+            SetWindowPos, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+            SWP_NOZORDER,
+        },
+    };
+
+    let Ok(hwnd) = window.hwnd() else { return };
+    let hwnd = hwnd.0 as windows_sys::Win32::Foundation::HWND;
+
+    // Transparent, undecorated WebView2 windows can retain the inactive native
+    // frame until the next pointer-driven repaint. Recalculate the non-client
+    // area without moving/activating the window, then repaint the WebView too.
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED
+                | SWP_NOACTIVATE
+                | SWP_NOMOVE
+                | SWP_NOSIZE
+                | SWP_NOZORDER,
+        );
+        let _ = RedrawWindow(
+            hwnd,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
+        );
+    }
+}
+
 fn save_window_rect(window: &tauri::Window) {
     use std::sync::Arc;
     let app = window.app_handle();
@@ -171,6 +210,10 @@ pub fn run() {
                 }
                 WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
                     save_window_rect(window);
+                }
+                WindowEvent::Focused(false) => {
+                    #[cfg(windows)]
+                    refresh_borderless_frame(window);
                 }
                 _ => {}
             }
