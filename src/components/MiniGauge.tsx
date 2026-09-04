@@ -8,10 +8,10 @@ function shortLabel(name: string, provider: string): string {
     if (name === "Pro") return "P";
     return name.slice(0, 2).toUpperCase();
   }
-  const hourMatch = name.match(/(\d+)\s*시간/);
-  if (hourMatch) return `${hourMatch[1]}h`;
-  const dayMatch = name.match(/(\d+)\s*일(?:\s*\((\w)\w*\))?/);
-  if (dayMatch) return dayMatch[2] ? `${dayMatch[1]}d(${dayMatch[2].toLowerCase()})` : `${dayMatch[1]}d`;
+  const hourMatch = name.match(/(\d+)\s*시간(?:\s*\(([^)]+)\))?/);
+  if (hourMatch) return hourMatch[2] ? `${hourMatch[1]}h(${hourMatch[2][0].toLowerCase()})` : `${hourMatch[1]}h`;
+  const dayMatch = name.match(/(\d+)\s*일(?:\s*\(([^)]+)\))?/);
+  if (dayMatch) return dayMatch[2] ? `${dayMatch[1]}d(${dayMatch[2][0].toLowerCase()})` : `${dayMatch[1]}d`;
   return name.slice(0, 3);
 }
 

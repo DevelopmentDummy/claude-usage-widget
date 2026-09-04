@@ -58,7 +58,20 @@ fn compute_time_progress(resets_epoch: i64, duration_sec: u64) -> f64 {
     ((now - start) as f64 / duration_sec as f64 * 100.0).round()
 }
 
-fn push_window(out: &mut Vec<UsageWindow>, key: &str, pw: &PrimaryOrSecondary) {
+fn bucket_label(bucket: &Bucket) -> String {
+    match bucket.limit_id.as_deref() {
+        Some("codex") => "Codex 전체".into(),
+        Some("base_model_inference") => "GPT 예비".into(),
+        _ => bucket
+            .limit_name
+            .as_deref()
+            .unwrap_or("기타")
+            .trim_start_matches("GPT-5.3-Codex-")
+            .to_string(),
+    }
+}
+
+fn push_window(out: &mut Vec<UsageWindow>, key: &str, label: &str, pw: &PrimaryOrSecondary) {
     let (util, dur_mins, reset_sec) = match (pw.used_percent, pw.window_duration_mins, pw.resets_at) {
         (Some(u), Some(d), Some(r)) => (u, d, r),
         _ => return,
@@ -66,7 +79,7 @@ fn push_window(out: &mut Vec<UsageWindow>, key: &str, pw: &PrimaryOrSecondary) {
     let dur_sec = dur_mins * 60;
     out.push(UsageWindow {
         key: key.to_string(),
-        name: window_name(dur_mins),
+        name: format!("{} ({})", window_name(dur_mins), label),
         utilization: util,
         resets_at: iso_from_epoch(reset_sec),
         time_progress: compute_time_progress(reset_sec, dur_sec),
@@ -75,21 +88,13 @@ fn push_window(out: &mut Vec<UsageWindow>, key: &str, pw: &PrimaryOrSecondary) {
 
 pub(crate) fn map_to_response(result: &RateLimitsResult) -> UsageResponse {
     let mut windows = Vec::new();
-    // Recent Pro responses expose additional model-specific and reserve buckets
-    // alongside the account's canonical `codex` allowance.  Those are internal
-    // sub-limits, not separate subscription allowances, and rendering all of them
-    // produces several indistinguishable "7일" gauges.  Prefer the canonical
-    // account bucket when present, while retaining the old all-buckets behavior
-    // for older/alternate response shapes that do not provide it.
-    let mut buckets: Vec<&Bucket> = match result.rate_limits_by_limit_id.get("codex") {
-        Some(codex) => vec![codex],
-        None => result.rate_limits_by_limit_id.values().collect(),
-    };
+    let mut buckets: Vec<&Bucket> = result.rate_limits_by_limit_id.values().collect();
     buckets.sort_by_key(|b| b.limit_id.clone().unwrap_or_default());
     for b in buckets {
         let base = b.limit_id.clone().unwrap_or_else(|| "unknown".into());
-        if let Some(p) = &b.primary { push_window(&mut windows, &format!("{}_primary", base), p); }
-        if let Some(s) = &b.secondary { push_window(&mut windows, &format!("{}_secondary", base), s); }
+        let label = bucket_label(b);
+        if let Some(p) = &b.primary { push_window(&mut windows, &format!("{}_primary", base), &label, p); }
+        if let Some(s) = &b.secondary { push_window(&mut windows, &format!("{}_secondary", base), &label, s); }
     }
     UsageResponse {
         provider: Provider::Codex,
@@ -218,12 +223,12 @@ mod tests {
         let result = RateLimitsResult { rate_limits_by_limit_id: map };
         let resp = map_to_response(&result);
         assert_eq!(resp.windows.len(), 2);
-        assert_eq!(resp.windows[0].name, "5시간");
-        assert_eq!(resp.windows[1].name, "7일");
+        assert_eq!(resp.windows[0].name, "5시간 (Plan A)");
+        assert_eq!(resp.windows[1].name, "7일 (Plan A)");
     }
 
     #[test]
-    fn canonical_codex_bucket_hides_model_specific_and_reserve_limits() {
+    fn labels_canonical_model_specific_and_reserve_limits() {
         fn weekly_bucket(id: &str, used_percent: f64) -> Bucket {
             Bucket {
                 limit_id: Some(id.into()),
@@ -264,9 +269,10 @@ mod tests {
         let result = RateLimitsResult { rate_limits_by_limit_id: map };
         let resp = map_to_response(&result);
 
-        assert_eq!(resp.windows.len(), 1);
-        assert_eq!(resp.windows[0].key, "codex_primary");
-        assert_eq!(resp.windows[0].name, "7일");
-        assert_eq!(resp.windows[0].utilization, 9.0);
+        assert_eq!(resp.windows.len(), 4);
+        assert_eq!(resp.windows[0].name, "7일 (GPT 예비)");
+        assert_eq!(resp.windows[1].name, "7일 (Codex 전체)");
+        assert_eq!(resp.windows[2].name, "5시간 (Spark)");
+        assert_eq!(resp.windows[3].name, "7일 (Spark)");
     }
 }
