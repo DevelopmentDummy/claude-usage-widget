@@ -6,6 +6,9 @@ function shortLabel(name: string, provider: string): string {
     if (name === "Flash Lite") return "FL";
     if (name === "Flash") return "F";
     if (name === "Pro") return "P";
+    if (name === "Claude") return "CL";
+    if (name === "GPT-OSS") return "GPT";
+    // New Gemini families (e.g. "Argon") come through by name
     return name.slice(0, 2).toUpperCase();
   }
   const hourMatch = name.match(/(\d+)\s*시간(?:\s*\(([^)]+)\))?/);
