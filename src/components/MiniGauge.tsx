@@ -6,6 +6,9 @@ function shortLabel(name: string, provider: string): string {
     if (name === "Flash Lite") return "FL";
     if (name === "Flash") return "F";
     if (name === "Pro") return "P";
+    // Antigravity group windows: "Gemini 5시간" → "G5h", "Claude·GPT 7일" → "C7d"
+    const groupMatch = name.match(/^(\S)\S*\s+(\d+)\s*(시간|일)$/);
+    if (groupMatch) return `${groupMatch[1]}${groupMatch[2]}${groupMatch[3] === "시간" ? "h" : "d"}`;
     return name.slice(0, 2).toUpperCase();
   }
   const hourMatch = name.match(/(\d+)\s*시간(?:\s*\(([^)]+)\))?/);

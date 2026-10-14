@@ -22,12 +22,12 @@ const LOGIN_CMD: Record<Provider, string> = {
 };
 
 // Gemini provider's response shape diverges between the agy (Antigravity) path
-// and the legacy gemini-cli path — only the former carries Claude/GPT-OSS rows.
+// and the legacy gemini-cli path — only the former carries pooled 5h/weekly rows.
 function resolveLabel(data: UsageResponse): { label: string; loginCmd: string } {
   if (data.provider !== "gemini") {
     return { label: LABELS[data.provider], loginCmd: LOGIN_CMD[data.provider] };
   }
-  const isAntigravity = data.status === "ok" && data.windows.some((w) => w.key === "claude" || w.key === "gpt");
+  const isAntigravity = data.status === "ok" && data.windows.some((w) => w.key.endsWith("-5h") || w.key.endsWith("-weekly"));
   return isAntigravity
     ? { label: "Antigravity", loginCmd: "agy" }
     : { label: "Gemini", loginCmd: "gemini" };

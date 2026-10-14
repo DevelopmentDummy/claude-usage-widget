@@ -82,7 +82,9 @@ pub(crate) struct QuotaResponse {
     pub buckets: Vec<QuotaBucket>,
 }
 
-// === Antigravity loadCodeAssist + fetchAvailableModels schemas ===
+// === Antigravity loadCodeAssist + retrieveUserQuotaSummary schemas ===
+// Since late 2026 Antigravity quota is no longer per-model: models are pooled into
+// groups (Gemini / Claude+GPT), each sharing a 5-hour and a weekly limit.
 
 #[derive(Deserialize)]
 struct LoadCodeAssistResp {
@@ -91,29 +93,33 @@ struct LoadCodeAssistResp {
 }
 
 #[derive(Deserialize)]
-struct AvailableModelsResp {
+struct QuotaSummaryResp {
     #[serde(default)]
-    models: std::collections::HashMap<String, ModelEntry>,
+    groups: Vec<SummaryGroup>,
 }
 
 #[derive(Deserialize)]
-struct ModelEntry {
+struct SummaryGroup {
     #[serde(default, rename = "displayName")]
-    display_name: Option<String>,
-    #[serde(default, rename = "quotaInfo")]
-    quota_info: Option<QuotaInfo>,
+    display_name: String,
+    #[serde(default)]
+    buckets: Vec<SummaryBucket>,
 }
 
 #[derive(Deserialize)]
-struct QuotaInfo {
-    #[serde(default, rename = "remainingFraction")]
-    remaining_fraction: Option<f64>,
+struct SummaryBucket {
+    #[serde(default, rename = "bucketId")]
+    bucket_id: String,
+    #[serde(default)]
+    window: String,
     #[serde(default, rename = "resetTime")]
     reset_time: Option<String>,
+    #[serde(default, rename = "remainingFraction")]
+    remaining_fraction: Option<f64>,
 }
 
-// === Family classification (shared) ===
-// 4 family display order: Flash, Pro, Claude, GPT-OSS.
+// === Family classification (legacy retrieveUserQuota) ===
+// Family display order: Flash, Pro (Claude/GPT-OSS never appear on this path).
 // flash-lite collapses into "flash"; "other" is unmapped (e.g., agent helpers).
 
 fn model_tier(model_id: &str) -> &'static str {
@@ -182,59 +188,42 @@ pub(crate) fn map_raw_to_response(raw: &QuotaResponse) -> UsageResponse {
     }
 }
 
-// === Antigravity mapping (fetchAvailableModels → family windows) ===
-// 4 families: Flash, Pro, Claude, GPT-OSS. For each family, pick the model
-// variant with the lowest remainingFraction (most consumed — conservative view).
-// Internal models (no displayName) and unmapped families are skipped.
+// === Antigravity mapping (retrieveUserQuotaSummary → group windows) ===
+// One row per (group, window): Gemini 5h/weekly, then Claude·GPT 5h/weekly.
+// The bucketId ("gemini-5h", "3p-weekly", ...) is used as the window key.
+// Unknown groups fall back to the server's group displayName.
 
-fn map_antigravity_to_response(raw: &AvailableModelsResp) -> UsageResponse {
-    use std::collections::HashMap;
-    let mut worst_per_tier: HashMap<&str, (&ModelEntry, &str)> = HashMap::new();
+const FIVE_HOUR_SEC: u64 = 5 * 60 * 60;
+const WEEK_SEC: u64 = 7 * DAY_SEC;
 
-    for (model_id, entry) in &raw.models {
-        if entry.display_name.is_none() { continue; }
-        let qi = match &entry.quota_info {
-            Some(q) if q.remaining_fraction.is_some() && q.reset_time.is_some() => q,
-            _ => continue,
-        };
-        let frac = qi.remaining_fraction.unwrap();
-        let tier = model_tier(model_id);
-        if tier == "other" { continue; }
-        worst_per_tier
-            .entry(tier)
-            .and_modify(|(existing, _)| {
-                let existing_frac = existing.quota_info.as_ref().and_then(|q| q.remaining_fraction).unwrap_or(1.0);
-                if frac < existing_frac {
-                    *existing = entry;
-                }
-            })
-            .or_insert((entry, tier));
-    }
+fn group_label(bucket_id: &str, group_name: &str) -> String {
+    if bucket_id.starts_with("gemini-") { "Gemini".into() }
+    else if bucket_id.starts_with("3p-") { "Claude·GPT".into() }
+    else { group_name.to_string() }
+}
 
+fn map_summary_to_response(raw: &QuotaSummaryResp) -> UsageResponse {
     let mut windows = Vec::new();
-    for key in TIER_ORDER {
-        if let Some((entry, _)) = worst_per_tier.get(key) {
-            let qi = entry.quota_info.as_ref().unwrap();
-            let frac = qi.remaining_fraction.unwrap_or(1.0);
-            let reset = qi.reset_time.clone().unwrap_or_default();
-            // resetTime cycle is variable per-model; estimate duration from the gap between now and reset,
-            // bounded between 1h (sprint) and DAY_SEC. Falls back to DAY_SEC if parse fails.
-            let duration = match chrono::DateTime::parse_from_rfc3339(&reset) {
-                Ok(dt) => {
-                    let gap = dt.timestamp() - chrono::Utc::now().timestamp();
-                    if gap > 0 { (gap as u64).max(3600).min(DAY_SEC) } else { DAY_SEC }
-                }
-                Err(_) => DAY_SEC,
+    for group in &raw.groups {
+        // 5h before weekly within each group, regardless of server order.
+        let mut buckets: Vec<&SummaryBucket> = group.buckets.iter().collect();
+        buckets.sort_by_key(|b| if b.window == "5h" { 0 } else { 1 });
+        for b in buckets {
+            let (frac, reset) = match (b.remaining_fraction, &b.reset_time) {
+                (Some(f), Some(r)) => (f, r.clone()),
+                _ => continue,
+            };
+            let (suffix, duration) = match b.window.as_str() {
+                "5h" => ("5시간", FIVE_HOUR_SEC),
+                "weekly" => ("7일", WEEK_SEC),
+                _ => continue,
             };
             windows.push(UsageWindow {
-                key: (*key).to_string(),
-                name: tier_label(key).to_string(),
+                key: b.bucket_id.clone(),
+                name: format!("{} {}", group_label(&b.bucket_id, &group.display_name), suffix),
                 utilization: ((1.0 - frac) * 100.0).round(),
+                time_progress: compute_time_progress(&reset, duration),
                 resets_at: reset,
-                time_progress: compute_time_progress(
-                    &entry.quota_info.as_ref().and_then(|q| q.reset_time.clone()).unwrap_or_default(),
-                    duration,
-                ),
             });
         }
     }
@@ -280,13 +269,13 @@ async fn fetch_antigravity(token: &str) -> AppResult<UsageResponse> {
         _ => None,
     };
 
-    // 2. fetchAvailableModels
+    // 2. retrieveUserQuotaSummary
     let body = match &project_id {
         Some(p) => serde_json::json!({ "project": p }),
         None => serde_json::json!({}),
     };
     let res = client
-        .post("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")
+        .post("https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")
         .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", "application/json")
         .header("User-Agent", "antigravity")
@@ -301,8 +290,8 @@ async fn fetch_antigravity(token: &str) -> AppResult<UsageResponse> {
         let body = res.text().await.unwrap_or_default();
         return Err(AppError::Api { status: status.as_u16(), message: body });
     }
-    let raw: AvailableModelsResp = res.json().await?;
-    Ok(map_antigravity_to_response(&raw))
+    let raw: QuotaSummaryResp = res.json().await?;
+    Ok(map_summary_to_response(&raw))
 }
 
 async fn fetch_legacy(token: &str) -> AppResult<UsageResponse> {
@@ -335,7 +324,7 @@ async fn fetch_legacy(token: &str) -> AppResult<UsageResponse> {
 
 pub async fn fetch() -> AppResult<UsageResponse> {
     // Prefer agy (Antigravity CLI) token if present — covers post-2026-06-18 era
-    // and gives richer model coverage (Gemini 3.x, preview variants).
+    // and reports the pooled 5-hour / weekly limits.
     if let Some(token) = read_agy_token() {
         return fetch_antigravity(&token).await;
     }
@@ -394,47 +383,45 @@ mod tests {
         assert_eq!(resp.windows.len(), 0);
     }
 
-    fn mk_entry(display: &str, frac: f64, reset: &str) -> ModelEntry {
-        ModelEntry {
-            display_name: Some(display.into()),
-            quota_info: Some(QuotaInfo {
-                remaining_fraction: Some(frac),
-                reset_time: Some(reset.into()),
-            }),
-        }
+    #[test]
+    fn summary_maps_groups_to_5h_and_weekly_rows() {
+        let raw: QuotaSummaryResp = serde_json::from_str(r#"{
+          "groups": [
+            { "displayName": "Gemini Models", "buckets": [
+              { "bucketId": "gemini-weekly", "window": "weekly", "resetTime": "2030-01-08T00:00:00Z", "remainingFraction": 0.982088 },
+              { "bucketId": "gemini-5h", "window": "5h", "resetTime": "2030-01-01T05:00:00Z", "remainingFraction": 0.9383521 }
+            ]},
+            { "displayName": "Claude and GPT models", "buckets": [
+              { "bucketId": "3p-weekly", "window": "weekly", "resetTime": "2030-01-08T00:00:00Z", "remainingFraction": 1 },
+              { "bucketId": "3p-5h", "window": "5h", "resetTime": "2030-01-01T05:00:00Z", "remainingFraction": 0.5 }
+            ]}
+          ]
+        }"#).unwrap();
+        let resp = map_summary_to_response(&raw);
+
+        let rows: Vec<_> = resp.windows.iter().map(|w| (w.key.as_str(), w.name.as_str(), w.utilization)).collect();
+        assert_eq!(rows, vec![
+            ("gemini-5h", "Gemini 5시간", 6.0),
+            ("gemini-weekly", "Gemini 7일", 2.0),
+            ("3p-5h", "Claude·GPT 5시간", 50.0),
+            ("3p-weekly", "Claude·GPT 7일", 0.0),
+        ]);
     }
 
     #[test]
-    fn antigravity_picks_worst_per_family() {
-        let mut models = std::collections::HashMap::new();
-        models.insert("gemini-3-flash".into(), mk_entry("Gemini 3 Flash", 0.9, "2030-01-01T00:00:00Z"));
-        models.insert("gemini-3.5-flash-low".into(), mk_entry("Gemini 3.5 Flash (Medium)", 0.4, "2030-01-01T00:00:00Z"));
-        models.insert("gemini-3.1-flash-lite".into(), mk_entry("Gemini 3.1 Flash Lite", 0.7, "2030-01-01T00:00:00Z"));
-        models.insert("gemini-3.1-pro-high".into(), mk_entry("Gemini 3.1 Pro (High)", 0.6, "2030-01-01T00:00:00Z"));
-        models.insert("gemini-3.1-pro-low".into(), mk_entry("Gemini 3.1 Pro (Low)", 0.3, "2030-01-01T00:00:00Z"));
-        models.insert("claude-sonnet-4-6".into(), mk_entry("Claude Sonnet 4.6 (Thinking)", 0.2, "2030-01-01T00:00:00Z"));
-        models.insert("claude-opus-4-6-thinking".into(), mk_entry("Claude Opus 4.6 (Thinking)", 0.5, "2030-01-01T00:00:00Z"));
-        models.insert("gpt-oss-120b-medium".into(), mk_entry("GPT-OSS 120B (Medium)", 0.8, "2030-01-01T00:00:00Z"));
-        models.insert("chat_23310".into(), ModelEntry { display_name: None, quota_info: None });
-        let raw = AvailableModelsResp { models };
-        let resp = map_antigravity_to_response(&raw);
-
-        // 4 families: Flash, Pro, Claude, GPT-OSS
-        assert_eq!(resp.windows.len(), 4);
-        let by_key: std::collections::HashMap<_, _> = resp.windows.iter().map(|w| (w.key.as_str(), w)).collect();
-        // flash: worst among gemini-3-flash (0.9), gemini-3.5-flash-low (0.4), gemini-3.1-flash-lite (0.7)
-        assert_eq!(by_key["flash"].utilization, 60.0);
-        // pro: worst between gemini-3.1-pro-high (0.6), gemini-3.1-pro-low (0.3)
-        assert_eq!(by_key["pro"].utilization, 70.0);
-        // claude: worst between sonnet (0.2), opus (0.5)
-        assert_eq!(by_key["claude"].utilization, 80.0);
-        // gpt: only gpt-oss-120b-medium (0.8)
-        assert_eq!(by_key["gpt"].utilization, 20.0);
-
-        // Order respects TIER_ORDER
-        assert_eq!(resp.windows[0].key, "flash");
-        assert_eq!(resp.windows[1].key, "pro");
-        assert_eq!(resp.windows[2].key, "claude");
-        assert_eq!(resp.windows[3].key, "gpt");
+    fn summary_skips_incomplete_and_unknown_window_buckets() {
+        let raw: QuotaSummaryResp = serde_json::from_str(r#"{
+          "groups": [
+            { "displayName": "New Group", "buckets": [
+              { "bucketId": "new-5h", "window": "5h", "resetTime": "2030-01-01T05:00:00Z", "remainingFraction": 0.25 },
+              { "bucketId": "new-daily", "window": "daily", "resetTime": "2030-01-02T00:00:00Z", "remainingFraction": 0.5 },
+              { "bucketId": "new-weekly", "window": "weekly" }
+            ]}
+          ]
+        }"#).unwrap();
+        let resp = map_summary_to_response(&raw);
+        assert_eq!(resp.windows.len(), 1);
+        assert_eq!(resp.windows[0].name, "New Group 5시간");
+        assert_eq!(resp.windows[0].utilization, 75.0);
     }
 }
