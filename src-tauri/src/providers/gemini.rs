@@ -118,6 +118,33 @@ struct SummaryBucket {
     remaining_fraction: Option<f64>,
 }
 
+// fetchAvailableModels — only used as a fallback for the Gemini row when the
+// summary omits the Gemini group (seen 2026-10-16: summary returned only 3p-*).
+// Every Gemini model carries the same pooled fraction, and its resetTime
+// matched the summary's gemini-5h bucket, so it maps to the 5-hour row.
+
+#[derive(Deserialize)]
+struct AvailableModelsResp {
+    #[serde(default)]
+    models: std::collections::HashMap<String, ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    #[serde(default, rename = "displayName")]
+    display_name: Option<String>,
+    #[serde(default, rename = "quotaInfo")]
+    quota_info: Option<ModelQuotaInfo>,
+}
+
+#[derive(Deserialize)]
+struct ModelQuotaInfo {
+    #[serde(default, rename = "remainingFraction")]
+    remaining_fraction: Option<f64>,
+    #[serde(default, rename = "resetTime")]
+    reset_time: Option<String>,
+}
+
 // === Family classification (legacy retrieveUserQuota) ===
 // Family display order: Flash, Pro (Claude/GPT-OSS never appear on this path).
 // flash-lite collapses into "flash"; "other" is unmapped (e.g., agent helpers).
@@ -237,6 +264,30 @@ fn map_summary_to_response(raw: &QuotaSummaryResp) -> UsageResponse {
     }
 }
 
+fn has_gemini_group(resp: &UsageResponse) -> bool {
+    resp.windows.iter().any(|w| w.key.starts_with("gemini-"))
+}
+
+// Most-consumed Gemini model (with a displayName) → "Gemini 5시간" row.
+fn gemini_row_from_models(raw: &AvailableModelsResp) -> Option<UsageWindow> {
+    let (frac, reset) = raw
+        .models
+        .iter()
+        .filter(|(id, e)| id.starts_with("gemini-") && e.display_name.is_some())
+        .filter_map(|(_, e)| {
+            let q = e.quota_info.as_ref()?;
+            Some((q.remaining_fraction?, q.reset_time.clone()?))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))?;
+    Some(UsageWindow {
+        key: "gemini-5h".into(),
+        name: "Gemini 5시간".into(),
+        utilization: ((1.0 - frac) * 100.0).round(),
+        time_progress: compute_time_progress(&reset, FIVE_HOUR_SEC),
+        resets_at: reset,
+    })
+}
+
 // === HTTP helpers ===
 
 async fn fetch_antigravity(token: &str) -> AppResult<UsageResponse> {
@@ -291,7 +342,30 @@ async fn fetch_antigravity(token: &str) -> AppResult<UsageResponse> {
         return Err(AppError::Api { status: status.as_u16(), message: body });
     }
     let raw: QuotaSummaryResp = res.json().await?;
-    Ok(map_summary_to_response(&raw))
+    let mut resp = map_summary_to_response(&raw);
+
+    // 3. Fallback: summary without a Gemini group → fill it from per-model quota.
+    //    A failure here keeps the summary rows rather than failing the whole fetch.
+    if !has_gemini_group(&resp) {
+        let models = client
+            .post("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "antigravity")
+            .body(body.to_string())
+            .send()
+            .await;
+        if let Ok(r) = models {
+            if r.status().is_success() {
+                if let Ok(raw) = r.json::<AvailableModelsResp>().await {
+                    if let Some(row) = gemini_row_from_models(&raw) {
+                        resp.windows.insert(0, row);
+                    }
+                }
+            }
+        }
+    }
+    Ok(resp)
 }
 
 async fn fetch_legacy(token: &str) -> AppResult<UsageResponse> {
@@ -423,5 +497,39 @@ mod tests {
         assert_eq!(resp.windows.len(), 1);
         assert_eq!(resp.windows[0].name, "New Group 5시간");
         assert_eq!(resp.windows[0].utilization, 75.0);
+    }
+
+    #[test]
+    fn gemini_row_falls_back_to_most_consumed_gemini_model() {
+        let raw: AvailableModelsResp = serde_json::from_str(r#"{
+          "models": {
+            "gemini-3-flash": { "displayName": "Gemini 3 Flash", "quotaInfo": { "remainingFraction": 0.6937189, "resetTime": "2030-01-01T05:00:00Z" } },
+            "gemini-2.5-pro": { "displayName": "Gemini 2.5 Pro", "quotaInfo": { "remainingFraction": 0.8, "resetTime": "2030-01-01T05:00:00Z" } },
+            "gemini-3.8-flash-tiered": { "quotaInfo": { "remainingFraction": 0.1, "resetTime": "2030-01-01T05:00:00Z" } },
+            "claude-opus-5-5-high": { "displayName": "Claude Opus 5.5 (High)", "quotaInfo": { "remainingFraction": 0.0, "resetTime": "2030-01-01T05:00:00Z" } }
+          }
+        }"#).unwrap();
+        let row = gemini_row_from_models(&raw).unwrap();
+        assert_eq!(row.key, "gemini-5h");
+        assert_eq!(row.name, "Gemini 5시간");
+        assert_eq!(row.utilization, 31.0);
+    }
+
+    #[test]
+    fn gemini_row_absent_without_gemini_quota() {
+        let raw: AvailableModelsResp = serde_json::from_str(r#"{
+          "models": { "gemini-3-flash": { "displayName": "Gemini 3 Flash" } }
+        }"#).unwrap();
+        assert!(gemini_row_from_models(&raw).is_none());
+    }
+
+    #[test]
+    fn summary_without_gemini_group_is_detected() {
+        let raw: QuotaSummaryResp = serde_json::from_str(r#"{
+          "groups": [ { "displayName": "Claude and GPT models", "buckets": [
+            { "bucketId": "3p-5h", "window": "5h", "resetTime": "2030-01-01T05:00:00Z", "remainingFraction": 1 }
+          ]} ]
+        }"#).unwrap();
+        assert!(!has_gemini_group(&map_summary_to_response(&raw)));
     }
 }
