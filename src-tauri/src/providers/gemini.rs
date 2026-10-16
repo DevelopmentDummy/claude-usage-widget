@@ -288,7 +288,48 @@ fn gemini_row_from_models(raw: &AvailableModelsResp) -> Option<UsageWindow> {
     })
 }
 
+// Prefer whichever summary carries the Gemini group; otherwise any successful
+// one (prod first). Both failed → prod's error.
+fn select_summary(prod: AppResult<UsageResponse>, daily: AppResult<UsageResponse>) -> AppResult<UsageResponse> {
+    match (prod, daily) {
+        (Ok(p), _) if has_gemini_group(&p) => Ok(p),
+        (_, Ok(d)) if has_gemini_group(&d) => Ok(d),
+        (Ok(p), _) => Ok(p),
+        (Err(_), Ok(d)) => Ok(d),
+        (Err(e), Err(_)) => Err(e),
+    }
+}
+
 // === HTTP helpers ===
+
+const SUMMARY_PROD_URL: &str = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+const SUMMARY_DAILY_URL: &str = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+
+async fn fetch_summary(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    body: &serde_json::Value,
+) -> AppResult<UsageResponse> {
+    let res = client
+        .post(url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "antigravity")
+        .body(body.to_string())
+        .send()
+        .await?;
+    let status = res.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(AppError::Expired);
+    }
+    if !status.is_success() {
+        let body = res.text().await.unwrap_or_default();
+        return Err(AppError::Api { status: status.as_u16(), message: body });
+    }
+    let raw: QuotaSummaryResp = res.json().await?;
+    Ok(map_summary_to_response(&raw))
+}
 
 async fn fetch_antigravity(token: &str) -> AppResult<UsageResponse> {
     let client = reqwest::Client::new();
@@ -320,31 +361,23 @@ async fn fetch_antigravity(token: &str) -> AppResult<UsageResponse> {
         _ => None,
     };
 
-    // 2. retrieveUserQuotaSummary
+    // 2. retrieveUserQuotaSummary — prod host first. Since 2026-10-16 the daily
+    //    host drops the Gemini group while prod still returns it (matching the
+    //    agy console), so daily is only a backup.
     let body = match &project_id {
         Some(p) => serde_json::json!({ "project": p }),
         None => serde_json::json!({}),
     };
-    let res = client
-        .post("https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Content-Type", "application/json")
-        .header("User-Agent", "antigravity")
-        .body(body.to_string())
-        .send()
-        .await?;
-    let status = res.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(AppError::Expired);
-    }
-    if !status.is_success() {
-        let body = res.text().await.unwrap_or_default();
-        return Err(AppError::Api { status: status.as_u16(), message: body });
-    }
-    let raw: QuotaSummaryResp = res.json().await?;
-    let mut resp = map_summary_to_response(&raw);
+    let prod = fetch_summary(&client, SUMMARY_PROD_URL, token, &body).await;
+    let mut resp = match prod {
+        Ok(r) if has_gemini_group(&r) => r,
+        prod => {
+            let daily = fetch_summary(&client, SUMMARY_DAILY_URL, token, &body).await;
+            select_summary(prod, daily)?
+        }
+    };
 
-    // 3. Fallback: summary without a Gemini group → fill it from per-model quota.
+    // 3. Neither summary had a Gemini group → fill it from per-model quota.
     //    A failure here keeps the summary rows rather than failing the whole fetch.
     if !has_gemini_group(&resp) {
         let models = client
@@ -531,5 +564,32 @@ mod tests {
           ]} ]
         }"#).unwrap();
         assert!(!has_gemini_group(&map_summary_to_response(&raw)));
+    }
+
+    fn summary_with(bucket_ids: &[&str]) -> UsageResponse {
+        let buckets: Vec<String> = bucket_ids
+            .iter()
+            .map(|id| format!(r#"{{ "bucketId": "{id}", "window": "5h", "resetTime": "2030-01-01T05:00:00Z", "remainingFraction": 1 }}"#))
+            .collect();
+        let json = format!(r#"{{ "groups": [ {{ "displayName": "G", "buckets": [ {} ] }} ] }}"#, buckets.join(","));
+        map_summary_to_response(&serde_json::from_str(&json).unwrap())
+    }
+
+    #[test]
+    fn select_summary_prefers_one_with_gemini_group() {
+        let r = select_summary(Ok(summary_with(&["3p-5h"])), Ok(summary_with(&["gemini-5h", "3p-5h"]))).unwrap();
+        assert!(has_gemini_group(&r));
+        let r = select_summary(Ok(summary_with(&["gemini-5h"])), Ok(summary_with(&["3p-5h"]))).unwrap();
+        assert!(has_gemini_group(&r));
+    }
+
+    #[test]
+    fn select_summary_falls_back_to_any_success_then_prod_error() {
+        let r = select_summary(Err(AppError::Expired), Ok(summary_with(&["3p-5h"]))).unwrap();
+        assert_eq!(r.windows[0].key, "3p-5h");
+        let r = select_summary(Ok(summary_with(&["3p-5h"])), Err(AppError::Expired)).unwrap();
+        assert_eq!(r.windows[0].key, "3p-5h");
+        let e = select_summary(Err(AppError::Expired), Err(AppError::Api { status: 500, message: String::new() }));
+        assert!(matches!(e, Err(AppError::Expired)));
     }
 }
