@@ -118,10 +118,9 @@ struct SummaryBucket {
     remaining_fraction: Option<f64>,
 }
 
-// fetchAvailableModels — only used as a fallback for the Gemini row when the
-// summary omits the Gemini group (seen 2026-10-16: summary returned only 3p-*).
-// Every Gemini model carries the same pooled fraction, and its resetTime
-// matched the summary's gemini-5h bucket, so it maps to the 5-hour row.
+// fetchAvailableModels — fills the Gemini row when the summary omits the Gemini
+// group (daily host since 2026-10-16: summary returns only 3p-*). Every Gemini
+// model carries the same pooled 5-hour fraction, so it maps to the 5-hour row.
 
 #[derive(Deserialize)]
 struct AvailableModelsResp {
@@ -288,31 +287,34 @@ fn gemini_row_from_models(raw: &AvailableModelsResp) -> Option<UsageWindow> {
     })
 }
 
-// Prefer whichever summary carries the Gemini group; otherwise any successful
-// one (prod first). Both failed → prod's error.
-fn select_summary(prod: AppResult<UsageResponse>, daily: AppResult<UsageResponse>) -> AppResult<UsageResponse> {
-    match (prod, daily) {
-        (Ok(p), _) if has_gemini_group(&p) => Ok(p),
-        (_, Ok(d)) if has_gemini_group(&d) => Ok(d),
-        (Ok(p), _) => Ok(p),
-        (Err(_), Ok(d)) => Ok(d),
-        (Err(e), Err(_)) => Err(e),
+// Summary without a Gemini group → prepend the per-model Gemini row.
+// The models response must carry Gemini quota; otherwise it is an error.
+fn merge_gemini_row(mut summary: UsageResponse, models: &AvailableModelsResp) -> AppResult<UsageResponse> {
+    if has_gemini_group(&summary) {
+        return Ok(summary);
     }
+    let row = gemini_row_from_models(models)
+        .ok_or_else(|| AppError::Other("fetchAvailableModels returned no Gemini quota".into()))?;
+    summary.windows.insert(0, row);
+    Ok(summary)
 }
 
 // === HTTP helpers ===
+// agy (Antigravity CLI) talks only to the daily host — generation, quota summary
+// and fetchAvailableModels alike — so its usage is charged to the daily pool.
+// The prod host (cloudcode-pa) reports a separate Gemini pool that agy usage
+// never moves (verified 2026-10-20), so it must not be used here.
 
-const SUMMARY_PROD_URL: &str = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
-const SUMMARY_DAILY_URL: &str = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+const DAILY_BASE: &str = "https://daily-cloudcode-pa.googleapis.com/v1internal";
 
-async fn fetch_summary(
+async fn post_daily<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
-    url: &str,
+    method: &str,
     token: &str,
     body: &serde_json::Value,
-) -> AppResult<UsageResponse> {
+) -> AppResult<T> {
     let res = client
-        .post(url)
+        .post(format!("{}:{}", DAILY_BASE, method))
         .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", "application/json")
         .header("User-Agent", "antigravity")
@@ -327,8 +329,7 @@ async fn fetch_summary(
         let body = res.text().await.unwrap_or_default();
         return Err(AppError::Api { status: status.as_u16(), message: body });
     }
-    let raw: QuotaSummaryResp = res.json().await?;
-    Ok(map_summary_to_response(&raw))
+    Ok(res.json().await?)
 }
 
 async fn fetch_antigravity(token: &str) -> AppResult<UsageResponse> {
@@ -338,67 +339,29 @@ async fn fetch_antigravity(token: &str) -> AppResult<UsageResponse> {
     let lca_body = serde_json::json!({
         "metadata": { "ideType": "ANTIGRAVITY", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI" }
     });
-    let lca_res = client
-        .post("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Content-Type", "application/json")
-        .header("User-Agent", "antigravity")
-        .body(lca_body.to_string())
-        .send()
-        .await?;
-    let lca_status = lca_res.status();
-    if lca_status == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(AppError::Expired);
-    }
-    if !lca_status.is_success() {
-        let body = lca_res.text().await.unwrap_or_default();
-        return Err(AppError::Api { status: lca_status.as_u16(), message: body });
-    }
-    let lca: LoadCodeAssistResp = lca_res.json().await?;
+    let lca: LoadCodeAssistResp = post_daily(&client, "loadCodeAssist", token, &lca_body).await?;
     let project_id = match lca.project {
         Some(serde_json::Value::String(s)) => Some(s),
         Some(serde_json::Value::Object(o)) => o.get("id").and_then(|v| v.as_str()).map(String::from),
         _ => None,
     };
 
-    // 2. retrieveUserQuotaSummary — prod host first. Since 2026-10-16 the daily
-    //    host drops the Gemini group while prod still returns it (matching the
-    //    agy console), so daily is only a backup.
+    // 2. retrieveUserQuotaSummary
     let body = match &project_id {
         Some(p) => serde_json::json!({ "project": p }),
         None => serde_json::json!({}),
     };
-    let prod = fetch_summary(&client, SUMMARY_PROD_URL, token, &body).await;
-    let mut resp = match prod {
-        Ok(r) if has_gemini_group(&r) => r,
-        prod => {
-            let daily = fetch_summary(&client, SUMMARY_DAILY_URL, token, &body).await;
-            select_summary(prod, daily)?
-        }
-    };
-
-    // 3. Neither summary had a Gemini group → fill it from per-model quota.
-    //    A failure here keeps the summary rows rather than failing the whole fetch.
-    if !has_gemini_group(&resp) {
-        let models = client
-            .post("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Type", "application/json")
-            .header("User-Agent", "antigravity")
-            .body(body.to_string())
-            .send()
-            .await;
-        if let Ok(r) = models {
-            if r.status().is_success() {
-                if let Ok(raw) = r.json::<AvailableModelsResp>().await {
-                    if let Some(row) = gemini_row_from_models(&raw) {
-                        resp.windows.insert(0, row);
-                    }
-                }
-            }
-        }
+    let raw: QuotaSummaryResp = post_daily(&client, "retrieveUserQuotaSummary", token, &body).await?;
+    let summary = map_summary_to_response(&raw);
+    if has_gemini_group(&summary) {
+        return Ok(summary);
     }
-    Ok(resp)
+
+    // 3. Since 2026-10-16 the daily summary omits the Gemini group. The pooled
+    //    Gemini fraction on fetchAvailableModels is the 5-hour window and moves
+    //    with agy usage, so it fills the Gemini row (no weekly value available).
+    let models: AvailableModelsResp = post_daily(&client, "fetchAvailableModels", token, &body).await?;
+    merge_gemini_row(summary, &models)
 }
 
 async fn fetch_legacy(token: &str) -> AppResult<UsageResponse> {
@@ -575,21 +538,30 @@ mod tests {
         map_summary_to_response(&serde_json::from_str(&json).unwrap())
     }
 
-    #[test]
-    fn select_summary_prefers_one_with_gemini_group() {
-        let r = select_summary(Ok(summary_with(&["3p-5h"])), Ok(summary_with(&["gemini-5h", "3p-5h"]))).unwrap();
-        assert!(has_gemini_group(&r));
-        let r = select_summary(Ok(summary_with(&["gemini-5h"])), Ok(summary_with(&["3p-5h"]))).unwrap();
-        assert!(has_gemini_group(&r));
+    fn models_with_gemini(frac: f64) -> AvailableModelsResp {
+        serde_json::from_str(&format!(r#"{{ "models": {{
+            "gemini-3-flash": {{ "displayName": "Gemini 3 Flash", "quotaInfo": {{ "remainingFraction": {frac}, "resetTime": "2030-01-01T05:00:00Z" }} }}
+        }} }}"#)).unwrap()
     }
 
     #[test]
-    fn select_summary_falls_back_to_any_success_then_prod_error() {
-        let r = select_summary(Err(AppError::Expired), Ok(summary_with(&["3p-5h"]))).unwrap();
-        assert_eq!(r.windows[0].key, "3p-5h");
-        let r = select_summary(Ok(summary_with(&["3p-5h"])), Err(AppError::Expired)).unwrap();
-        assert_eq!(r.windows[0].key, "3p-5h");
-        let e = select_summary(Err(AppError::Expired), Err(AppError::Api { status: 500, message: String::new() }));
-        assert!(matches!(e, Err(AppError::Expired)));
+    fn merge_prepends_model_row_when_summary_lacks_gemini() {
+        let r = merge_gemini_row(summary_with(&["3p-5h"]), &models_with_gemini(0.9070784)).unwrap();
+        let keys: Vec<_> = r.windows.iter().map(|w| w.key.as_str()).collect();
+        assert_eq!(keys, vec!["gemini-5h", "3p-5h"]);
+        assert_eq!(r.windows[0].utilization, 9.0);
+    }
+
+    #[test]
+    fn merge_keeps_summary_gemini_group_as_is() {
+        let r = merge_gemini_row(summary_with(&["gemini-5h", "3p-5h"]), &models_with_gemini(0.1)).unwrap();
+        assert_eq!(r.windows.len(), 2);
+        assert_eq!(r.windows[0].utilization, 0.0);
+    }
+
+    #[test]
+    fn merge_errors_when_no_gemini_quota_anywhere() {
+        let empty: AvailableModelsResp = serde_json::from_str(r#"{ "models": {} }"#).unwrap();
+        assert!(merge_gemini_row(summary_with(&["3p-5h"]), &empty).is_err());
     }
 }
