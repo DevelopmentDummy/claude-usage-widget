@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { Provider, UsageResponse } from "../lib/types";
 import UsageGauge from "./UsageGauge";
+import MissingGeminiWindows from "./MissingGeminiWindows";
 import { ipc } from "../lib/ipc";
 
 const COLORS: Record<Provider, string> = {
@@ -111,6 +112,7 @@ export default function ProviderCard({ data, retryAt }: { data: UsageResponse; r
       {data.windows.map((w) => (
         <UsageGauge key={`${data.provider}-${w.key}`} window={w} />
       ))}
+      <MissingGeminiWindows data={data} />
 
       {data.status === "rate_limited" && data.windows.length > 0 && (
         <div className="mt-1 text-[10px] text-yellow-500/80">

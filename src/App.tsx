@@ -4,6 +4,7 @@ import Header from "./components/Header";
 import ProviderCard from "./components/ProviderCard";
 import SettingsMenu from "./components/SettingsMenu";
 import MiniGauge from "./components/MiniGauge";
+import MissingGeminiWindows from "./components/MissingGeminiWindows";
 import { ipc, type ProviderSnapshot } from "./lib/ipc";
 import type { Provider, Settings, ViewMode } from "./lib/types";
 
@@ -390,6 +391,7 @@ export default function App() {
               {activeSnap?.response.status === "not_authenticated" ? "로그인 안됨" : "—"}
             </span>
           )}
+          <MissingGeminiWindows data={activeSnap?.response} />
           {activeSnap?.response.status === "rate_limited" && activeSnap.retryAt && (
             <span
               className="flex-shrink-0 text-[9px] text-yellow-500/90 whitespace-nowrap"

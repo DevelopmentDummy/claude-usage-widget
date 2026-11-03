@@ -100,8 +100,6 @@ struct QuotaSummaryResp {
 
 #[derive(Deserialize)]
 struct SummaryGroup {
-    #[serde(default, rename = "displayName")]
-    display_name: String,
     #[serde(default)]
     buckets: Vec<SummaryBucket>,
 }
@@ -116,32 +114,6 @@ struct SummaryBucket {
     reset_time: Option<String>,
     #[serde(default, rename = "remainingFraction")]
     remaining_fraction: Option<f64>,
-}
-
-// fetchAvailableModels — fills the Gemini row when the summary omits the Gemini
-// group (daily host since 2026-10-16: summary returns only 3p-*). Every Gemini
-// model carries the same pooled 5-hour fraction, so it maps to the 5-hour row.
-
-#[derive(Deserialize)]
-struct AvailableModelsResp {
-    #[serde(default)]
-    models: std::collections::HashMap<String, ModelEntry>,
-}
-
-#[derive(Deserialize)]
-struct ModelEntry {
-    #[serde(default, rename = "displayName")]
-    display_name: Option<String>,
-    #[serde(default, rename = "quotaInfo")]
-    quota_info: Option<ModelQuotaInfo>,
-}
-
-#[derive(Deserialize)]
-struct ModelQuotaInfo {
-    #[serde(default, rename = "remainingFraction")]
-    remaining_fraction: Option<f64>,
-    #[serde(default, rename = "resetTime")]
-    reset_time: Option<String>,
 }
 
 // === Family classification (legacy retrieveUserQuota) ===
@@ -215,45 +187,33 @@ pub(crate) fn map_raw_to_response(raw: &QuotaResponse) -> UsageResponse {
 }
 
 // === Antigravity mapping (retrieveUserQuotaSummary → group windows) ===
-// One row per (group, window): Gemini 5h/weekly, then Claude·GPT 5h/weekly.
-// The bucketId ("gemini-5h", "3p-weekly", ...) is used as the window key.
-// Unknown groups fall back to the server's group displayName.
+// Only explicit Gemini five-hour and weekly buckets are displayed.
 
 const FIVE_HOUR_SEC: u64 = 5 * 60 * 60;
 const WEEK_SEC: u64 = 7 * DAY_SEC;
 
-fn group_label(bucket_id: &str, group_name: &str) -> String {
-    if bucket_id.starts_with("gemini-") { "Gemini".into() }
-    else if bucket_id.starts_with("3p-") { "Claude·GPT".into() }
-    else { group_name.to_string() }
-}
-
 fn map_summary_to_response(raw: &QuotaSummaryResp) -> UsageResponse {
     let mut windows = Vec::new();
-    for group in &raw.groups {
-        // 5h before weekly within each group, regardless of server order.
-        let mut buckets: Vec<&SummaryBucket> = group.buckets.iter().collect();
-        buckets.sort_by_key(|b| if b.window == "5h" { 0 } else { 1 });
-        for b in buckets {
-            let (frac, reset) = match (b.remaining_fraction, &b.reset_time) {
-                (Some(f), Some(r)) => (f, r.clone()),
-                _ => continue,
-            };
-            let (suffix, duration) = match b.window.as_str() {
-                "5h" => ("5시간", FIVE_HOUR_SEC),
-                "weekly" => ("7일", WEEK_SEC),
-                _ => continue,
-            };
+    for (period, key, name, duration) in [
+        ("5h", "gemini-5h", "Gemini 5시간", FIVE_HOUR_SEC),
+        ("weekly", "gemini-weekly", "Gemini 7일", WEEK_SEC),
+    ] {
+        let bucket = raw.groups.iter().flat_map(|g| &g.buckets).find(|b| {
+            b.bucket_id.starts_with("gemini-") && b.window == period
+                && b.remaining_fraction.is_some_and(|f| f.is_finite())
+                && b.reset_time.as_ref().is_some_and(|r| !r.is_empty())
+        });
+        if let Some(b) = bucket {
+            let reset = b.reset_time.as_ref().unwrap();
             windows.push(UsageWindow {
-                key: b.bucket_id.clone(),
-                name: format!("{} {}", group_label(&b.bucket_id, &group.display_name), suffix),
-                utilization: ((1.0 - frac) * 100.0).round(),
-                time_progress: compute_time_progress(&reset, duration),
-                resets_at: reset,
+                key: key.into(),
+                name: name.into(),
+                utilization: (1.0 - b.remaining_fraction.unwrap()) * 100.0,
+                time_progress: compute_time_progress(reset, duration),
+                resets_at: reset.clone(),
             });
         }
     }
-
     UsageResponse {
         provider: Provider::Gemini,
         status: Status::Ok,
@@ -263,47 +223,13 @@ fn map_summary_to_response(raw: &QuotaSummaryResp) -> UsageResponse {
     }
 }
 
-fn has_gemini_group(resp: &UsageResponse) -> bool {
-    resp.windows.iter().any(|w| w.key.starts_with("gemini-"))
-}
-
-// Most-consumed Gemini model (with a displayName) → "Gemini 5시간" row.
-fn gemini_row_from_models(raw: &AvailableModelsResp) -> Option<UsageWindow> {
-    let (frac, reset) = raw
-        .models
-        .iter()
-        .filter(|(id, e)| id.starts_with("gemini-") && e.display_name.is_some())
-        .filter_map(|(_, e)| {
-            let q = e.quota_info.as_ref()?;
-            Some((q.remaining_fraction?, q.reset_time.clone()?))
-        })
-        .min_by(|a, b| a.0.total_cmp(&b.0))?;
-    Some(UsageWindow {
-        key: "gemini-5h".into(),
-        name: "Gemini 5시간".into(),
-        utilization: ((1.0 - frac) * 100.0).round(),
-        time_progress: compute_time_progress(&reset, FIVE_HOUR_SEC),
-        resets_at: reset,
-    })
-}
-
-// Summary without a Gemini group → prepend the per-model Gemini row.
-// The models response must carry Gemini quota; otherwise it is an error.
-fn merge_gemini_row(mut summary: UsageResponse, models: &AvailableModelsResp) -> AppResult<UsageResponse> {
-    if has_gemini_group(&summary) {
-        return Ok(summary);
-    }
-    let row = gemini_row_from_models(models)
-        .ok_or_else(|| AppError::Other("fetchAvailableModels returned no Gemini quota".into()))?;
-    summary.windows.insert(0, row);
-    Ok(summary)
-}
-
 // === HTTP helpers ===
 // agy (Antigravity CLI) talks only to the daily host — generation, quota summary
 // and fetchAvailableModels alike — so its usage is charged to the daily pool.
 // The prod host (cloudcode-pa) reports a separate Gemini pool that agy usage
 // never moves (verified 2026-10-20), so it must not be used here.
+
+const AGY_USER_AGENT: &str = "antigravity/cli/1.4.12 (aidev_client; os_type=windows; arch=amd64)";
 
 const DAILY_BASE: &str = "https://daily-cloudcode-pa.googleapis.com/v1internal";
 
@@ -317,7 +243,7 @@ async fn post_daily<T: serde::de::DeserializeOwned>(
         .post(format!("{}:{}", DAILY_BASE, method))
         .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", "application/json")
-        .header("User-Agent", "antigravity")
+        .header("User-Agent", AGY_USER_AGENT)
         .body(body.to_string())
         .send()
         .await?;
@@ -352,16 +278,8 @@ async fn fetch_antigravity(token: &str) -> AppResult<UsageResponse> {
         None => serde_json::json!({}),
     };
     let raw: QuotaSummaryResp = post_daily(&client, "retrieveUserQuotaSummary", token, &body).await?;
-    let summary = map_summary_to_response(&raw);
-    if has_gemini_group(&summary) {
-        return Ok(summary);
-    }
-
-    // 3. Since 2026-10-16 the daily summary omits the Gemini group. The pooled
-    //    Gemini fraction on fetchAvailableModels is the 5-hour window and moves
-    //    with agy usage, so it fills the Gemini row (no weekly value available).
-    let models: AvailableModelsResp = post_daily(&client, "fetchAvailableModels", token, &body).await?;
-    merge_gemini_row(summary, &models)
+    // Model quotaInfo has no explicit period and may represent weekly usage.
+    Ok(map_summary_to_response(&raw))
 }
 
 async fn fetch_legacy(token: &str) -> AppResult<UsageResponse> {
@@ -454,114 +372,40 @@ mod tests {
     }
 
     #[test]
-    fn summary_maps_groups_to_5h_and_weekly_rows() {
+    fn explicit_windows_preserve_precision_reset_and_order() {
         let raw: QuotaSummaryResp = serde_json::from_str(r#"{
-          "groups": [
-            { "displayName": "Gemini Models", "buckets": [
-              { "bucketId": "gemini-weekly", "window": "weekly", "resetTime": "2030-01-08T00:00:00Z", "remainingFraction": 0.982088 },
-              { "bucketId": "gemini-5h", "window": "5h", "resetTime": "2030-01-01T05:00:00Z", "remainingFraction": 0.9383521 }
-            ]},
-            { "displayName": "Claude and GPT models", "buckets": [
-              { "bucketId": "3p-weekly", "window": "weekly", "resetTime": "2030-01-08T00:00:00Z", "remainingFraction": 1 },
-              { "bucketId": "3p-5h", "window": "5h", "resetTime": "2030-01-01T05:00:00Z", "remainingFraction": 0.5 }
-            ]}
-          ]
+          "groups": [{ "buckets": [
+            {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.114,"resetTime":"2026-11-07T20:44:03Z"},
+            {"bucketId":"3p-5h","window":"5h","remainingFraction":0,"resetTime":"2026-11-03T23:41:01Z"},
+            {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.62,"resetTime":"2026-11-03T23:41:01Z"},
+            {"bucketId":"gemini-duplicate","window":"5h","remainingFraction":0.9,"resetTime":"2030-01-01T00:00:00Z"}
+          ]}]
         }"#).unwrap();
         let resp = map_summary_to_response(&raw);
-
-        let rows: Vec<_> = resp.windows.iter().map(|w| (w.key.as_str(), w.name.as_str(), w.utilization)).collect();
-        assert_eq!(rows, vec![
-            ("gemini-5h", "Gemini 5시간", 6.0),
-            ("gemini-weekly", "Gemini 7일", 2.0),
-            ("3p-5h", "Claude·GPT 5시간", 50.0),
-            ("3p-weekly", "Claude·GPT 7일", 0.0),
-        ]);
+        assert_eq!(resp.windows.len(), 2);
+        assert_eq!(resp.windows[0].key, "gemini-5h");
+        assert!((resp.windows[0].utilization - 38.0).abs() < 1e-9);
+        assert_eq!(resp.windows[0].resets_at, "2026-11-03T23:41:01Z");
+        assert_eq!(resp.windows[1].key, "gemini-weekly");
+        assert!((resp.windows[1].utilization - 88.6).abs() < 1e-9);
+        assert_eq!(resp.windows[1].resets_at, "2026-11-07T20:44:03Z");
     }
 
     #[test]
-    fn summary_skips_incomplete_and_unknown_window_buckets() {
+    fn missing_windows_are_not_inferred_and_zero_remaining_is_valid() {
         let raw: QuotaSummaryResp = serde_json::from_str(r#"{
-          "groups": [
-            { "displayName": "New Group", "buckets": [
-              { "bucketId": "new-5h", "window": "5h", "resetTime": "2030-01-01T05:00:00Z", "remainingFraction": 0.25 },
-              { "bucketId": "new-daily", "window": "daily", "resetTime": "2030-01-02T00:00:00Z", "remainingFraction": 0.5 },
-              { "bucketId": "new-weekly", "window": "weekly" }
-            ]}
-          ]
+          "groups": [{ "buckets": [
+            {"bucketId":"gemini-5h","window":"5h","resetTime":"2030-01-01T00:00:00Z"},
+            {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.5,"resetTime":""},
+            {"bucketId":"gemini-daily","window":"daily","remainingFraction":0.5,"resetTime":"2030-01-01T00:00:00Z"},
+            {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0,"resetTime":"2030-01-01T00:00:00Z"}
+          ]}]
         }"#).unwrap();
         let resp = map_summary_to_response(&raw);
         assert_eq!(resp.windows.len(), 1);
-        assert_eq!(resp.windows[0].name, "New Group 5시간");
-        assert_eq!(resp.windows[0].utilization, 75.0);
-    }
-
-    #[test]
-    fn gemini_row_falls_back_to_most_consumed_gemini_model() {
-        let raw: AvailableModelsResp = serde_json::from_str(r#"{
-          "models": {
-            "gemini-3-flash": { "displayName": "Gemini 3 Flash", "quotaInfo": { "remainingFraction": 0.6937189, "resetTime": "2030-01-01T05:00:00Z" } },
-            "gemini-2.5-pro": { "displayName": "Gemini 2.5 Pro", "quotaInfo": { "remainingFraction": 0.8, "resetTime": "2030-01-01T05:00:00Z" } },
-            "gemini-3.8-flash-tiered": { "quotaInfo": { "remainingFraction": 0.1, "resetTime": "2030-01-01T05:00:00Z" } },
-            "claude-opus-5-5-high": { "displayName": "Claude Opus 5.5 (High)", "quotaInfo": { "remainingFraction": 0.0, "resetTime": "2030-01-01T05:00:00Z" } }
-          }
-        }"#).unwrap();
-        let row = gemini_row_from_models(&raw).unwrap();
-        assert_eq!(row.key, "gemini-5h");
-        assert_eq!(row.name, "Gemini 5시간");
-        assert_eq!(row.utilization, 31.0);
-    }
-
-    #[test]
-    fn gemini_row_absent_without_gemini_quota() {
-        let raw: AvailableModelsResp = serde_json::from_str(r#"{
-          "models": { "gemini-3-flash": { "displayName": "Gemini 3 Flash" } }
-        }"#).unwrap();
-        assert!(gemini_row_from_models(&raw).is_none());
-    }
-
-    #[test]
-    fn summary_without_gemini_group_is_detected() {
-        let raw: QuotaSummaryResp = serde_json::from_str(r#"{
-          "groups": [ { "displayName": "Claude and GPT models", "buckets": [
-            { "bucketId": "3p-5h", "window": "5h", "resetTime": "2030-01-01T05:00:00Z", "remainingFraction": 1 }
-          ]} ]
-        }"#).unwrap();
-        assert!(!has_gemini_group(&map_summary_to_response(&raw)));
-    }
-
-    fn summary_with(bucket_ids: &[&str]) -> UsageResponse {
-        let buckets: Vec<String> = bucket_ids
-            .iter()
-            .map(|id| format!(r#"{{ "bucketId": "{id}", "window": "5h", "resetTime": "2030-01-01T05:00:00Z", "remainingFraction": 1 }}"#))
-            .collect();
-        let json = format!(r#"{{ "groups": [ {{ "displayName": "G", "buckets": [ {} ] }} ] }}"#, buckets.join(","));
-        map_summary_to_response(&serde_json::from_str(&json).unwrap())
-    }
-
-    fn models_with_gemini(frac: f64) -> AvailableModelsResp {
-        serde_json::from_str(&format!(r#"{{ "models": {{
-            "gemini-3-flash": {{ "displayName": "Gemini 3 Flash", "quotaInfo": {{ "remainingFraction": {frac}, "resetTime": "2030-01-01T05:00:00Z" }} }}
-        }} }}"#)).unwrap()
-    }
-
-    #[test]
-    fn merge_prepends_model_row_when_summary_lacks_gemini() {
-        let r = merge_gemini_row(summary_with(&["3p-5h"]), &models_with_gemini(0.9070784)).unwrap();
-        let keys: Vec<_> = r.windows.iter().map(|w| w.key.as_str()).collect();
-        assert_eq!(keys, vec!["gemini-5h", "3p-5h"]);
-        assert_eq!(r.windows[0].utilization, 9.0);
-    }
-
-    #[test]
-    fn merge_keeps_summary_gemini_group_as_is() {
-        let r = merge_gemini_row(summary_with(&["gemini-5h", "3p-5h"]), &models_with_gemini(0.1)).unwrap();
-        assert_eq!(r.windows.len(), 2);
-        assert_eq!(r.windows[0].utilization, 0.0);
-    }
-
-    #[test]
-    fn merge_errors_when_no_gemini_quota_anywhere() {
-        let empty: AvailableModelsResp = serde_json::from_str(r#"{ "models": {} }"#).unwrap();
-        assert!(merge_gemini_row(summary_with(&["3p-5h"]), &empty).is_err());
+        assert_eq!(resp.windows[0].key, "gemini-weekly");
+        assert_eq!(resp.windows[0].utilization, 100.0);
+        let empty = serde_json::from_str(r#"{"groups":[]}"#).unwrap();
+        assert!(map_summary_to_response(&empty).windows.is_empty());
     }
 }
