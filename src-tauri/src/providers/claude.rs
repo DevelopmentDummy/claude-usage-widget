@@ -54,9 +54,9 @@ pub(crate) struct RawExtraUsage {
     #[serde(default)]
     pub is_enabled: bool,
     #[serde(default)]
-    pub monthly_limit: f64,
+    pub monthly_limit: Option<f64>,
     #[serde(default)]
-    pub used_credits: f64,
+    pub used_credits: Option<f64>,
     #[serde(default)]
     pub utilization: Option<f64>,
     /// 소수 자릿수. USD=2. 미제공 시 2로 가정한다.
@@ -180,8 +180,8 @@ fn map_extra_usage(raw: &RawUsage) -> Option<ExtraUsage> {
     let divisor = 10f64.powi(e.decimal_places.unwrap_or(2) as i32);
     Some(ExtraUsage {
         is_enabled: e.is_enabled,
-        monthly_limit: e.monthly_limit / divisor,
-        used_credits: e.used_credits / divisor,
+        monthly_limit: e.monthly_limit.unwrap_or_default() / divisor,
+        used_credits: e.used_credits.unwrap_or_default() / divisor,
         utilization: e.utilization,
     })
 }
@@ -282,7 +282,7 @@ pub async fn fetch() -> AppResult<UsageResponse> {
                     preview
                 ),
             );
-            Err(AppError::Expired)
+            Err(AppError::Json(e))
         }
     }
 }
@@ -524,6 +524,26 @@ mod tests {
         let extra = map_raw_to_response(&raw).extra_usage.unwrap();
         assert_eq!(extra.used_credits, 2.5);
         assert_eq!(extra.monthly_limit, 50.0);
+    }
+
+    #[test]
+    fn disabled_extra_usage_null_amounts_preserve_weekly_usage() {
+        // Actual API shape when extra usage is disabled (2026-11-05).
+        let raw: RawUsage = serde_json::from_str(r#"{
+            "five_hour": null,
+            "seven_day": {"utilization": 3.0, "resets_at": "2030-01-01T00:00:00Z"},
+            "extra_usage": {"is_enabled": false, "monthly_limit": null,
+                "used_credits": null, "utilization": null, "decimal_places": null},
+            "limits": [{"kind":"weekly_all","group":"weekly","percent":3,
+                "resets_at":"2030-01-01T00:00:00Z","scope":null}]
+        }"#).unwrap();
+        let resp = map_raw_to_response(&raw);
+        assert_eq!(resp.windows.len(), 1);
+        assert_eq!(resp.windows[0].utilization, 3.0);
+        let extra = resp.extra_usage.unwrap();
+        assert!(!extra.is_enabled);
+        assert_eq!(extra.monthly_limit, 0.0);
+        assert_eq!(extra.used_credits, 0.0);
     }
 
     #[test]

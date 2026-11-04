@@ -44,3 +44,7 @@ Tauri 2 · Rust · React 19 · TypeScript · Vite · Tailwind 3.
 ## License
 
 MIT
+
+## Troubleshooting
+
+Claude API의 비활성 추가 사용량(`extra_usage`) 금액은 `null`일 수 있습니다. 위젯은 이를 처리하며, 응답 파싱 오류를 토큰 만료로 분류하지 않습니다. API 응답 형식 오류 때문에 CLI 로그인 갱신을 반복하지 않습니다.
